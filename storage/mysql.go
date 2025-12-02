@@ -128,12 +128,14 @@ func NewMySQLStorage(config MySQLConfig) (*MySQLStorage, error) {
 		facility INT,
 		priority INT,
 		remote_ip VARCHAR(45),
+		protocol VARCHAR(10),
 		raw_message TEXT,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		INDEX idx_timestamp (timestamp),
 		INDEX idx_hostname (hostname),
 		INDEX idx_severity (severity),
-		INDEX idx_created_at (created_at)
+		INDEX idx_created_at (created_at),
+		INDEX idx_protocol (protocol)
 	)`
 
 	if _, err := db.Exec(createTableSQL); err != nil {
@@ -166,8 +168,8 @@ func (ms *MySQLStorage) refreshCountCache() {
 func (ms *MySQLStorage) Store(message *types.SyslogMessage) error {
 	query := `
 	INSERT INTO syslog_messages
-	(timestamp, hostname, tag, content, severity, facility, priority, remote_ip, raw_message)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	(timestamp, hostname, tag, content, severity, facility, priority, remote_ip, protocol, raw_message)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	_, err := ms.db.Exec(query,
 		message.Timestamp,
@@ -178,6 +180,7 @@ func (ms *MySQLStorage) Store(message *types.SyslogMessage) error {
 		message.Facility,
 		message.Priority,
 		message.RemoteIP,
+		message.Protocol,
 		message.RawMessage,
 	)
 
@@ -202,7 +205,7 @@ func (ms *MySQLStorage) GetRecentMessages(limit int) ([]*types.SyslogMessage, er
 	defer cancel()
 
 	query := `
-	SELECT id, timestamp, hostname, tag, content, severity, facility, priority, remote_ip, raw_message, created_at
+	SELECT id, timestamp, hostname, tag, content, severity, facility, priority, remote_ip, protocol, raw_message, created_at
 	FROM syslog_messages
 	ORDER BY id DESC
 	LIMIT ?`
@@ -226,6 +229,7 @@ func (ms *MySQLStorage) GetRecentMessages(limit int) ([]*types.SyslogMessage, er
 			&msg.Facility,
 			&msg.Priority,
 			&msg.RemoteIP,
+			&msg.Protocol,
 			&msg.RawMessage,
 			&msg.CreatedAt,
 		)
@@ -246,7 +250,7 @@ func (ms *MySQLStorage) GetMessagesByDate(date time.Time) ([]*types.SyslogMessag
 	endOfDay := startOfDay.Add(24 * time.Hour)
 
 	query := `
-	SELECT id, timestamp, hostname, tag, content, severity, facility, priority, remote_ip, raw_message, created_at
+	SELECT id, timestamp, hostname, tag, content, severity, facility, priority, remote_ip, protocol, raw_message, created_at
 	FROM syslog_messages
 	WHERE timestamp >= ? AND timestamp < ?
 	ORDER BY id DESC`
@@ -270,6 +274,7 @@ func (ms *MySQLStorage) GetMessagesByDate(date time.Time) ([]*types.SyslogMessag
 			&msg.Facility,
 			&msg.Priority,
 			&msg.RemoteIP,
+			&msg.Protocol,
 			&msg.RawMessage,
 			&msg.CreatedAt,
 		)
@@ -306,7 +311,7 @@ func (ms *MySQLStorage) GetMessagesPaginated(offset, limit int) ([]*types.Syslog
 	}
 
 	query := `
-	SELECT id, timestamp, hostname, tag, content, severity, facility, priority, remote_ip, raw_message, created_at
+	SELECT id, timestamp, hostname, tag, content, severity, facility, priority, remote_ip, protocol, raw_message, created_at
 	FROM syslog_messages
 	ORDER BY id DESC
 	LIMIT ? OFFSET ?`
@@ -330,6 +335,7 @@ func (ms *MySQLStorage) GetMessagesPaginated(offset, limit int) ([]*types.Syslog
 			&msg.Facility,
 			&msg.Priority,
 			&msg.RemoteIP,
+			&msg.Protocol,
 			&msg.RawMessage,
 			&msg.CreatedAt,
 		)
@@ -415,7 +421,7 @@ func (ms *MySQLStorage) SearchMessages(searchTerm string, hostname string, sever
 
     // Main query - SAFE acum
     query := fmt.Sprintf(`
-        SELECT id, timestamp, hostname, tag, content, severity, facility, priority, remote_ip, raw_message, created_at
+        SELECT id, timestamp, hostname, tag, content, severity, facility, priority, remote_ip, protocol, raw_message, created_at
         FROM syslog_messages
         %s
         ORDER BY id DESC
@@ -438,7 +444,7 @@ func (ms *MySQLStorage) SearchMessages(searchTerm string, hostname string, sever
         err := rows.Scan(
             &msg.ID, &msg.Timestamp, &msg.Hostname, &msg.Tag,
             &msg.Content, &msg.Severity, &msg.Facility, &msg.Priority,
-            &msg.RemoteIP, &msg.RawMessage, &msg.CreatedAt,
+            &msg.RemoteIP, &msg.Protocol, &msg.RawMessage, &msg.CreatedAt,
         )
         if err != nil {
             return nil, 0, fmt.Errorf("failed to scan message: %v", err)

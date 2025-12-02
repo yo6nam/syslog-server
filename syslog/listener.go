@@ -121,7 +121,7 @@ func (s *Server) StartUDPWithContext(ctx context.Context, addr string) (*net.UDP
 				}
 
 				message := string(buffer[:n])
-				go s.handler.ProcessMessage(message, addr.IP.String())
+				go s.handler.ProcessMessage(message, addr.IP.String(), "UDP")
 			}
 		}
 	}()
@@ -149,7 +149,7 @@ func (s *Server) handleTCPConnection(conn net.Conn) {
 	for scanner.Scan() {
 		message := strings.TrimSpace(scanner.Text())
 		if message != "" {
-			s.handler.ProcessMessage(message, remoteAddr)
+			s.handler.ProcessMessage(message, remoteAddr, "TCP")
 		}
 	}
 

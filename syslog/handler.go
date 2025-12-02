@@ -52,7 +52,7 @@ func NewHandler(storage storage.Storage, wsHub *websocket.Hub, alerter *alerting
 	}
 }
 
-func (h *Handler) ProcessMessage(rawMessage string, remoteIP string) {
+func (h *Handler) ProcessMessage(rawMessage string, remoteIP string, protocol string) {
 	atomic.AddUint64(&h.totalReceived, 1)
 
 	// Check ban list for IP
@@ -71,7 +71,7 @@ func (h *Handler) ProcessMessage(rawMessage string, remoteIP string) {
 
 		// Log doar la fiecare 100 de mesaje dropped
 		if atomic.LoadUint64(&h.totalDropped)%100 == 0 {
-			log.Printf("⚠ Rate limit: dropped 100 messages from %s", remoteIP)
+			log.Printf("⚠️ Rate limit: dropped 100 messages from %s", remoteIP)
 		}
 		return
 	}
@@ -81,6 +81,8 @@ func (h *Handler) ProcessMessage(rawMessage string, remoteIP string) {
 		log.Printf("Error parsing message: %v", err)
 		return
 	}
+
+	message.Protocol = protocol
 
 	// Check ban list for hostname
 	if h.bannedHostnames[strings.ToLower(message.Hostname)] {
@@ -112,7 +114,7 @@ func (h *Handler) ProcessMessage(rawMessage string, remoteIP string) {
 
 	h.broadcastMessage(message)
 
-	log.Printf("Received syslog message from %s: %s", remoteIP, message.Content)
+	log.Printf("Received syslog message from %s via %s: %s", remoteIP, protocol, message.Content)
 }
 
 func (h *Handler) shouldExclude(content string) bool {
@@ -136,6 +138,7 @@ func (h *Handler) broadcastMessage(message *types.SyslogMessage) {
 		"facility_string": message.FacilityString(),
 		"priority":        message.Priority,
 		"remote_ip":       message.RemoteIP,
+		"protocol":        message.Protocol,
 		"raw_message":     message.RawMessage,
 	}
 

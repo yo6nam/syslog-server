@@ -14,6 +14,7 @@ type SyslogMessage struct {
     Facility   int       `json:"facility"`
     Priority   int       `json:"priority"`
     RemoteIP   string    `json:"remote_ip"`
+    Protocol   string    `json:"protocol"`
     RawMessage string    `json:"raw_message"`
     CreatedAt  time.Time `json:"created_at"`
 }
