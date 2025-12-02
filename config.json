@@ -1,0 +1,49 @@
+{
+  "mysql": {
+    "enabled": true,
+    "host": "localhost",
+    "port": "3306",
+    "user": "syslog",
+    "password": "password",
+    "database": "syslog"
+  },
+  "storage": {
+    "log_directory": "./logs"
+  },
+  "ports": {
+    "syslog_tcp": "0.0.0.0:514",
+    "syslog_udp": "0.0.0.0:514",
+    "web": ":8080"
+  },
+  "rate_limiter": {
+    "messages_per_second": 100,
+    "burst_size": 200
+  },
+  "ban_list": {
+    "ips": [
+      "192.168.1.100",
+      "10.0.0.50"
+    ],
+    "hostnames": [
+      "spam-host",
+      "unwanted-device"
+    ]
+  },
+  "filters": {
+    "exclude_patterns": [
+      "missed interrupt",
+      "xradio_wlan",
+      "some other repetitive message"
+    ]
+  },
+  "alerting": {
+    "enabled": false,
+    "webhook_url": "https://domain.tld/endpoint",
+    "severities": [
+      "emergency",
+      "critical"
+    ],
+    "rate_limit_minutes": 15,
+    "timeout_seconds": 10
+  }
+}

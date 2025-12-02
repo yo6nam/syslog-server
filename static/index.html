@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Syslog Server</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+		<div class="header">
+            <h2>📊 Syslog Server <span style="font-size: 14px; font-weight: normal; color: #888; margin-left: 15px;">Real-time syslog message monitoring</span></h2>
+        </div>
+
+        <div class="pagination-info">
+            <div class="stats">
+                <div class="stat-item">Total Messages: <span id="totalMessages">0</span></div>
+                <div class="stat-item">Loaded: <span id="loadedMessages">0</span></div>
+                <div class="stat-item">Updated: <span id="lastUpdate">-</span></div>
+                <div class="stat-item">Session Uptime: <span id="uptime">00:00:00</span></div>
+
+            </div>
+
+            <button class="btn load-more" id="loadMoreBtn" onclick="loadMoreMessages()">
+                Load More Messages
+                <span id="loadingText" style="display: none;"> Loading...</span>
+            </button>
+        </div>
+
+        <div class="controls">
+            <button class="btn" onclick="clearMessages()">Clear Messages</button>
+            <button class="btn" onclick="toggleAutoScroll()">Auto-scroll: <span id="autoScrollStatus">On</span></button>
+            <button class="btn" onclick="toggleFilters()">🔍 Filters</button>
+            <button class="btn" onclick="toggleSearch()">🔎 Search All</button>
+            <button class="btn" onclick="exportMessages()">Export JSON</button>
+            <button class="btn" onclick="toggleFullscreenLogs()">📊 Fullscreen Live Logs</button>
+        </div>
+
+		<div class="search-mode-banner hidden" id="searchModeBanner">
+		    <div>
+		        <span style="font-size: 14px;">⚠️ SEARCH MODE</span>
+		        <div style="font-size: 12px; font-weight: normal; margin-top: 4px;" id="searchCriteria"></div>
+		    </div>
+		    <button class="btn clear" onclick="clearSearch()" style="padding: 4px 12px;">Exit Search Mode</button>
+		</div>
+
+<div class="filters hidden" id="filtersPanel">
+    <div class="filter-group">
+        <input type="text" id="searchFilter" class="filter-input" placeholder="Search content...">
+        <input type="text" id="hostnameFilter" class="filter-input" placeholder="Filter by hostname...">
+        <input type="text" id="highlightFilter" class="filter-input" placeholder="Highlight text...">
+
+        <select id="severityFilter" class="filter-input">
+            <option value="">All Severities</option>
+            <optgroup label="Specific Severity">
+                <option value="emergency">Emergency</option>
+                <option value="alert">Alert</option>
+                <option value="critical">Critical</option>
+                <option value="error">Error</option>
+                <option value="warning">Warning</option>
+                <option value="notice">Notice</option>
+                <option value="info">Info</option>
+                <option value="debug">Debug</option>
+            </optgroup>
+            <optgroup label="Range Filters">
+                <option value="range:0-2">Critical and above (Emergency, Alert)</option>
+                <option value="range:0-3">Error and above</option>
+                <option value="range:0-4">Warning and above</option>
+                <option value="range:0-5">Notice and above</option>
+                <option value="range:0-6">Info and above</option>
+            </optgroup>
+        </select>
+
+        <div class="checkbox-wrapper">
+            <input type="checkbox" id="showRawMessage" checked>
+            <label for="showRawMessage">Raw Messages</label> <!-- Schimbat aici -->
+        </div>
+
+        <button class="btn clear" onclick="clearFilters()">Clear Filters</button>
+    </div>
+</div>
+
+        <div class="filters hidden" id="searchPanel">
+            <div class="filter-group">
+                <input type="text" id="searchAllInput" class="filter-input" placeholder="Search in ALL messages..." style="min-width: 300px;">
+                <input type="text" id="searchAllHostname" class="filter-input" placeholder="Hostname...">
+
+                <select id="searchAllSeverity" class="filter-input">
+                    <option value="">All Severities</option>
+                    <optgroup label="Specific Severity">
+                        <option value="emergency">Emergency</option>
+                        <option value="alert">Alert</option>
+                        <option value="critical">Critical</option>
+                        <option value="error">Error</option>
+                        <option value="warning">Warning</option>
+                        <option value="notice">Notice</option>
+                        <option value="info">Info</option>
+                        <option value="debug">Debug</option>
+                    </optgroup>
+                    <optgroup label="Range Filters">
+                        <option value="range:0-2">Critical and above (Emergency, Alert)</option>
+                        <option value="range:0-3">Error and above</option>
+                        <option value="range:0-4">Warning and above</option>
+                        <option value="range:0-5">Notice and above</option>
+                        <option value="range:0-6">Info and above</option>
+                    </optgroup>
+                </select>
+
+                <input type="date" id="searchDateFrom" class="filter-input" placeholder="From date">
+                <input type="date" id="searchDateTo" class="filter-input" placeholder="To date">
+
+                <button class="btn" onclick="performSearch()">Search</button>
+                <button class="btn clear" onclick="clearSearch()">Clear Search</button>
+
+                <span id="searchResults" style="margin-left: 10px; color: #888;"></span>
+            </div>
+        </div>
+
+        <div class="messages" id="messagesContainer">
+            <div id="messagesList"></div>
+        </div>
+    </div>
+
+    <div class="connection-status" id="connectionStatus">
+        <span id="statusText">Connecting...</span>
+    </div>
+
+<div id="fullscreenLogs" class="fullscreen-logs hidden">
+    <div class="fullscreen-header">
+        <div class="fullscreen-header-left">
+            <h2>📊 Live Syslog Monitor</h2>
+            <div class="fullscreen-stats">
+                <span>Total: <span id="fullscreenTotal">0</span></span>
+                <span>Showing: <span id="fullscreenShowing">0</span></span>
+                <span>Updated: <span id="fullscreenLastUpdate">-</span></span>
+            </div>
+        </div>
+        <div class="fullscreen-controls">
+            <button class="btn" onclick="toggleFullscreenAutoScroll()">Auto-scroll: <span id="fullscreenAutoScrollStatus">On</span></button>
+            <button class="btn" onclick="exportMessages()">Export JSON</button>
+            <button class="btn" onclick="toggleFullscreenLogs()">Close</button>
+        </div>
+    </div>
+
+    <div class="fullscreen-messages" id="fullscreenMessagesContainer">
+        <div id="fullscreenMessagesList"></div>
+    </div>
+
+    <div class="fullscreen-filters">
+        <input type="text" id="fullscreenSearch" class="filter-input" placeholder="Search messages...">
+        <input type="text" id="fullscreenSource" class="filter-input" placeholder="Filter by source...">
+        <input type="text" id="fullscreenHighlight" class="filter-input" placeholder="Highlight text...">
+        <select id="fullscreenSeverity" class="filter-input">
+            <option value="">All Severities</option>
+            <option value="emergency">Emergency</option>
+            <option value="alert">Alert</option>
+            <option value="critical">Critical</option>
+            <option value="error">Error</option>
+            <option value="warning">Warning</option>
+            <option value="notice">Notice</option>
+            <option value="info">Info</option>
+            <option value="debug">Debug</option>
+        </select>
+    </div>
+</div>
+<script src="js/syslog-client.js"></script>
+<script src="js/websocket.js"></script>
+<script src="js/filters.js"></script>
+<script src="js/ui-manager.js"></script>
+<script src="js/search.js"></script>
+<script src="js/fullscreen.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
