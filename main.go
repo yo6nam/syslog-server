@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-    "syslog-server/alerting"
+	"syslog-server/alerting"
 	"syslog-server/syslog"
 	"syslog-server/storage"
 	"syslog-server/types"
@@ -62,7 +62,6 @@ func main() {
 		} else {
 			log.Println("✅ MySQL storage connected successfully!")
 			log.Println("✅ Using both MySQL and file storage")
-
 			storageBackend = storage.NewMultiStorage(mysqlStorage, fileStorage)
 		}
 	} else {
@@ -70,13 +69,18 @@ func main() {
 		storageBackend = fileStorage
 	}
 
-    // Create alerter
-	alerter := alerting.NewWebhookAlerter(*config)
-
 	wsHub := websocket.NewHub()
 	go wsHub.Run()
 
-	// Create handler with all config settings
+	// Create alerter
+	alerter := alerting.NewWebhookAlerter(*config)
+	alerter.StartCleanup()
+
+	// ✅ Create retention manager
+	retentionManager := storage.NewRetentionManager(storageBackend, *config)
+	retentionManager.Start()
+
+	// Create handler with alerter
 	syslogHandler := syslog.NewHandler(
 		storageBackend,
 		wsHub,
@@ -113,7 +117,7 @@ func main() {
 
 	// Start Web server
 	webServer := web.NewServer(wsHub, storageBackend)
-	webServer.SetHandler(syslogHandler) // Setează handler-ul pentru stats
+	webServer.SetHandler(syslogHandler)
 
 	syslogServer := syslog.NewServer(syslogHandler)
 
@@ -171,6 +175,9 @@ func main() {
 	<-sigChan
 
 	log.Println("Shutting down syslog server gracefully...")
+
+	// ✅ Stop retention manager
+	retentionManager.Stop()
 
 	// 1. Cancelează context-ul pentru a opri acceptarea de conexiuni noi
 	shutdownCancel()

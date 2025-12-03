@@ -10,42 +10,52 @@ import (
 
 type MultiStorage struct {
 	backends []Storage
+	mysql    *MySQLStorage
 	mutex    sync.Mutex
 }
 
 func NewMultiStorage(backends ...Storage) *MultiStorage {
-	return &MultiStorage{
+	ms := &MultiStorage{
 		backends: backends,
 	}
+
+	for _, backend := range backends {
+		if mysqlBackend, ok := backend.(*MySQLStorage); ok {
+			ms.mysql = mysqlBackend
+			break
+		}
+	}
+
+	return ms
 }
 
 func (ms *MultiStorage) Store(message *types.SyslogMessage) error {
-    var wg sync.WaitGroup
-    errorChan := make(chan error, len(ms.backends))
+	var wg sync.WaitGroup
+	errorChan := make(chan error, len(ms.backends))
 
-    for _, backend := range ms.backends {
-        wg.Add(1)
-        go func(b Storage) {
-            defer wg.Done()
-            if err := b.Store(message); err != nil {
-                errorChan <- err
-            }
-        }(backend)
-    }
+	for _, backend := range ms.backends {
+		wg.Add(1)
+		go func(b Storage) {
+			defer wg.Done()
+			if err := b.Store(message); err != nil {
+				errorChan <- err
+			}
+		}(backend)
+	}
 
-    wg.Wait()
-    close(errorChan)
+	wg.Wait()
+	close(errorChan)
 
-    // Colectează erorile
-    var errors []error
-    for err := range errorChan {
-        errors = append(errors, err)
-    }
+	// Colectează erorile
+	var errors []error
+	for err := range errorChan {
+		errors = append(errors, err)
+	}
 
-    if len(errors) > 0 {
-        return errors[0]
-    }
-    return nil
+	if len(errors) > 0 {
+		return errors[0]
+	}
+	return nil
 }
 
 // Pentru a putea închide conexiunile MySQL
@@ -97,7 +107,7 @@ func (ms *MultiStorage) GetTotalMessageCount() (int, error) {
 	return 0, fmt.Errorf("no storage backend supports counting")
 }
 
-// SearchMessages - foloseşte primul backend care suportă search
+// SearchMessages - folosește primul backend care suportă search
 func (ms *MultiStorage) SearchMessages(searchTerm string, hostname string, severity int, severityMax int, dateFrom time.Time, dateTo time.Time, limit int, offset int) ([]*types.SyslogMessage, int, error) {
 	type Searcher interface {
 		SearchMessages(searchTerm string, hostname string, severity int, severityMax int, dateFrom time.Time, dateTo time.Time, limit int, offset int) ([]*types.SyslogMessage, int, error)

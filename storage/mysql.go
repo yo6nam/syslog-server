@@ -454,3 +454,27 @@ func (ms *MySQLStorage) SearchMessages(searchTerm string, hostname string, sever
 
     return messages, totalCount, nil
 }
+
+// DeleteOldMessages șterge mesajele mai vechi decât cutoffDate
+func (ms *MySQLStorage) DeleteOldMessages(cutoffDate time.Time) (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	query := `DELETE FROM syslog_messages WHERE timestamp < ?`
+
+	result, err := ms.db.ExecContext(ctx, query, cutoffDate)
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete old messages: %v", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get rows affected: %v", err)
+	}
+
+	// Invalidează cache-ul după ștergere
+	ms.countCache.Set(0)
+	ms.refreshCountCache()
+
+	return int(rowsAffected), nil
+}

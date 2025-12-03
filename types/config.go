@@ -31,12 +31,18 @@ type Config struct {
 	} `json:"rate_limiter"`
 
 	Alerting struct {
-		Enabled           bool     `json:"enabled"`
-		WebhookURL        string   `json:"webhook_url"`
-		Severities        []string `json:"severities"`
-		RateLimitMinutes  int      `json:"rate_limit_minutes"`
-		TimeoutSeconds    int      `json:"timeout_seconds"`
+		Enabled          bool     `json:"enabled"`
+		WebhookURL       string   `json:"webhook_url"`
+		Severities       []string `json:"severities"`
+		RateLimitMinutes int      `json:"rate_limit_minutes"`
+		TimeoutSeconds   int      `json:"timeout_seconds"`
 	} `json:"alerting"`
+
+	Retention struct {
+		Enabled bool   `json:"enabled"`
+		Days    int    `json:"days"`
+		RunAt   string `json:"run_at"` // Format: "HH:MM" (24h)
+	} `json:"retention"`
 
 	BanList struct {
 		IPs       []string `json:"ips"`
@@ -75,6 +81,11 @@ func LoadConfig(configPath string) (*Config, error) {
 	config.Alerting.Severities = []string{"emergency", "critical"}
 	config.Alerting.RateLimitMinutes = 60
 	config.Alerting.TimeoutSeconds = 10
+
+	// ✅ Default retention
+	config.Retention.Enabled = false
+	config.Retention.Days = 90
+	config.Retention.RunAt = "02:00"
 
 	// Default ban list (gol)
 	config.BanList.IPs = []string{}

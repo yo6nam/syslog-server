@@ -45,5 +45,10 @@
     ],
     "rate_limit_minutes": 15,
     "timeout_seconds": 10
+  },
+  "retention": {
+    "enabled": true,
+    "days": 90,
+    "run_at": "02:00"
   }
 }
