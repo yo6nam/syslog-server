@@ -45,7 +45,7 @@ func NewWebhookAlerter(config types.Config) *WebhookAlerter {
 
 	log.Printf("🔔 Webhook alerting enabled for: %v", config.Alerting.Severities)
 	log.Printf("📡 Webhook URL: %s", config.Alerting.WebhookURL)
-	log.Printf("⏱️  Rate limit: %d minutes per hostname", config.Alerting.RateLimitMinutes)
+	log.Printf("⏱ Rate limit: %d minutes per hostname", config.Alerting.RateLimitMinutes)
 
 	return &WebhookAlerter{
 		enabled:          true,
@@ -76,7 +76,7 @@ func (wa *WebhookAlerter) SendAlert(message *types.SyslogMessage) {
 	}
 
 	if !wa.canSend(hostname) {
-		log.Printf("⏸️  Alert rate limited for host: %s (severity: %s)", hostname, severity)
+		log.Printf("⏸ Alert rate limited for host: %s (severity: %s)", hostname, severity)
 		return
 	}
 
@@ -147,7 +147,7 @@ func (wa *WebhookAlerter) sendWebhook(message *types.SyslogMessage, severity str
 			message.Hostname,
 			message.Content[:min(50, len(message.Content))])
 	} else {
-		log.Printf("⚠️  Webhook returned status %d for %s/%s",
+		log.Printf("⚠ Webhook returned status %d for %s/%s",
 			resp.StatusCode,
 			message.Hostname,
 			severity)
