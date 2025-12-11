@@ -30,7 +30,7 @@ class SyslogClient {
             isLoading: false,
             hasMore: true,
             initialLoad: true,
-            maxMessages: 500
+            maxMessages: 1000
         };
 
         // Fullscreen
@@ -295,15 +295,92 @@ class SyslogClient {
         }
     }
 
-    exportMessages() {
-        const dataStr = JSON.stringify(this.messages, null, 2);
-        const dataBlob = new Blob([dataStr], {type: 'application/json'});
+	exportMessages() {
+	    // Determină ce mesaje să exporte
+	    let messagesToExport;
 
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(dataBlob);
-        link.download = `syslog-export-${new Date().toISOString().split('T')[0]}.json`;
-        link.click();
-    }
+	    if (this.searchMode && this.messages.length > 0) {
+	        // În modul search, exportă mesajele din search
+	        messagesToExport = this.messages;
+	    } else if (this.filteredMessages.length > 0) {
+	        // Altfel, exportă mesajele filtrate
+	        messagesToExport = this.filteredMessages;
+	    } else {
+	        // Fallback la toate mesajele
+	        messagesToExport = this.messages;
+	    }
+
+	    // Creează obiectul pentru export cu metadate
+	    const exportData = {
+	        meta: {
+	            exported_at: new Date().toISOString(),
+	            mode: this.searchMode ? 'search_results' : 'live_messages',
+	            total_in_buffer: this.messages.length,
+	            filtered_count: this.filteredMessages.length,
+	            exported_count: messagesToExport.length,
+	            search_mode: this.searchMode,
+	            search_criteria: this.searchMode && this.searchManager?.currentSearchParams
+	                ? this.searchManager.currentSearchParams
+	                : null
+	        },
+	        messages: messagesToExport.map(msg => ({
+	            id: msg.id,
+	            timestamp: msg.timestamp,
+	            hostname: msg.hostname,
+	            tag: msg.tag,
+	            content: msg.content,
+	            severity: msg.severity,
+	            severity_string: this.getSeverityString(msg.severity),
+	            facility: msg.facility,
+	            facility_string: this.getFacilityString(msg.facility),
+	            remote_ip: msg.remote_ip,
+	            protocol: msg.protocol,
+	            raw_message: msg.raw_message,
+	            created_at: msg.created_at
+	        }))
+	    };
+
+	    const dataStr = JSON.stringify(exportData, null, 2);
+	    const dataBlob = new Blob([dataStr], {type: 'application/json'});
+
+	    const link = document.createElement('a');
+	    link.href = URL.createObjectURL(dataBlob);
+
+	    // Nume de fișier diferit pentru search vs normal
+	    const dateStr = new Date().toISOString().split('T')[0];
+	    const mode = this.searchMode ? 'search' : 'live';
+	    link.download = `syslog-export-${mode}-${dateStr}.json`;
+
+	    link.click();
+	    URL.revokeObjectURL(link.href);
+
+	    // Feedback visual
+	    this.showExportToast(messagesToExport.length, this.searchMode);
+	}
+
+	showExportToast(count, isSearch) {
+	    const toast = document.createElement('div');
+	    toast.style.cssText = `
+	        position: fixed;
+	        bottom: 20px;
+	        right: 20px;
+	        background: #28a745;
+	        color: white;
+	        padding: 12px 20px;
+	        border-radius: 4px;
+	        z-index: 10000;
+	        font-size: 14px;
+	        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+	    `;
+	    toast.textContent = `✅ Exported ${count} ${isSearch ? 'search results' : 'messages'} to JSON`;
+	    document.body.appendChild(toast);
+
+	    setTimeout(() => {
+	        toast.style.opacity = '0';
+	        toast.style.transition = 'opacity 0.3s';
+	        setTimeout(() => toast.remove(), 300);
+	    }, 3000);
+	}
 
     // === METODE DELEGATE === (pentru manageri)
     applyFilters() {
