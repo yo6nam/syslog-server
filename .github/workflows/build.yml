@@ -17,8 +17,18 @@ permissions:
 
 jobs:
   build:
-    name: Build (linux/amd64)
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -63,8 +73,8 @@ jobs:
 
       - name: Build
         env:
-          GOOS: linux
-          GOARCH: amd64
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
           VERSION: ${{ steps.version.outputs.version }}
           COMMIT: ${{ steps.version.outputs.commit }}
@@ -75,18 +85,23 @@ jobs:
             -X syslog-server/version.Version=${VERSION} \
             -X syslog-server/version.Commit=${COMMIT} \
             -X syslog-server/version.BuildDate=${BUILD_DATE}" \
-            -o dist/${BINARY_NAME}-linux-amd64 .
+            -o dist/${BINARY_NAME}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
 
-      - name: Smoke test binary
+      - name: Smoke test binary (native OS only)
+        if: matrix.goos == 'linux'
         run: |
-          file dist/${BINARY_NAME}-linux-amd64
-          ./dist/${BINARY_NAME}-linux-amd64 -v
+          file dist/${BINARY_NAME}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          ./dist/${BINARY_NAME}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} -v
+
+      - name: Inspect binary (cross-compiled, cannot execute here)
+        if: matrix.goos != 'linux'
+        run: file dist/${BINARY_NAME}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BINARY_NAME }}-linux-amd64
-          path: dist/${{ env.BINARY_NAME }}-linux-amd64
+          name: ${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
           if-no-files-found: error
           retention-days: 30
 
@@ -94,4 +109,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ env.BINARY_NAME }}-linux-amd64
+          files: dist/${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
