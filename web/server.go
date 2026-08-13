@@ -1,8 +1,10 @@
 package web
 
 import (
+	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -15,6 +17,15 @@ import (
 	"syslog-server/types"
 	"syslog-server/websocket"
 )
+
+// staticFiles conține tot conținutul directorului static/ înglobat direct în
+// binar la compilare. Așa serverul funcționează standalone, fără să fie
+// nevoie să cari folderul static/ alături de executabil.
+//
+//go:embed all:static
+var staticFiles embed.FS
+
+const embeddedStaticRoot = "static"
 
 type Server struct {
 	wsHub   *websocket.Hub
@@ -37,8 +48,7 @@ func (s *Server) SetHandler(handler interface{}) {
 
 // SetupRoutes configurează rutele HTTP
 func (s *Server) SetupRoutes() {
-	fs := http.FileServer(http.Dir(s.getStaticDir()))
-	http.Handle("/", fs)
+	http.Handle("/", s.buildStaticHandler())
 	http.HandleFunc("/ws", s.wsHub.ServeWebSocket)
 	http.HandleFunc("/api/messages", s.handleGetMessages)
 	http.HandleFunc("/api/messages/paginated", s.handleGetMessagesPaginated)
@@ -53,27 +63,28 @@ func (s *Server) Start(addr string) error {
 	return http.ListenAndServe(addr, nil)
 }
 
-func (s *Server) getStaticDir() string {
-	// Încearcă mai multe locații posibile
-	possibleDirs := []string{
-		"./static",
-		"./../static",
-		"static",
-	}
-
-	for _, dir := range possibleDirs {
-		if _, err := os.Stat(dir); err == nil {
-			if _, err := os.Stat(filepath.Join(dir, "index.html")); err == nil {
-				log.Printf("Serving static files from: %s", dir)
-				return dir
-			}
+// buildStaticHandler alege sursa fișierelor UI:
+//  1. Dacă există un director ./static pe disc (lângă binar) cu un index.html,
+//     îl folosește — util pentru a personaliza UI-ul fără recompilare.
+//  2. Altfel folosește fișierele înglobate în binar la compilare (implicit),
+//     ceea ce face executabilul complet standalone.
+func (s *Server) buildStaticHandler() http.Handler {
+	if info, err := os.Stat("./static"); err == nil && info.IsDir() {
+		if _, err := os.Stat(filepath.Join("./static", "index.html")); err == nil {
+			log.Println("Serving static files from disk override: ./static")
+			return http.FileServer(http.Dir("./static"))
 		}
 	}
 
-	// Creează directorul static dacă nu există
-	os.MkdirAll("./static", 0755)
-	log.Printf("Using default static directory: ./static")
-	return "./static"
+	sub, err := fs.Sub(staticFiles, embeddedStaticRoot)
+	if err != nil {
+		log.Printf("Failed to load embedded static assets (%v) — serving empty ./static from disk", err)
+		os.MkdirAll("./static", 0755)
+		return http.FileServer(http.Dir("./static"))
+	}
+
+	log.Println("Serving static files from embedded assets (built into the binary)")
+	return http.FileServer(http.FS(sub))
 }
 
 // handleGetMessages returnează mesaje recente

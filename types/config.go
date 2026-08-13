@@ -54,7 +54,7 @@ type Config struct {
 	} `json:"filters"`
 }
 
-func LoadConfig(configPath string) (*Config, error) {
+func LoadConfig(configPath string) (*Config, bool, error) {
 	config := &Config{}
 
 	// Valori default
@@ -98,19 +98,34 @@ func LoadConfig(configPath string) (*Config, error) {
 	if configPath != "" {
 		file, err := os.Open(configPath)
 		if err != nil {
-			// Dacă fișierul nu există, returnează config default
+			// Dacă fișierul nu există, scrie configul default pe disc
+			// (ca să existe ceva editabil) și continuă cu valorile default.
 			if os.IsNotExist(err) {
-				return config, nil
+				if writeErr := writeDefaultConfig(configPath, config); writeErr != nil {
+					// Nu putem scrie fișierul (ex: director read-only) — continuăm
+					// oricum cu valorile default, doar că nu vom avea un fișier creat.
+					return config, false, nil
+				}
+				return config, true, nil
 			}
-			return nil, err
+			return nil, false, err
 		}
 		defer file.Close()
 
 		decoder := json.NewDecoder(file)
 		if err := decoder.Decode(config); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 
-	return config, nil
+	return config, false, nil
+}
+
+// writeDefaultConfig scrie configul default (formatat, ușor de editat) la configPath.
+func writeDefaultConfig(configPath string, config *Config) error {
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(configPath, data, 0644)
 }
