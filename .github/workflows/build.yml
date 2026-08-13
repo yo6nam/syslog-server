@@ -29,34 +29,58 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Tidy & verify modules
+      - name: Tidy modules, verify, vet
         run: |
-          go mod tidy
+          echo "== go env =="
+          go env GOFLAGS GOPROXY GOSUMDB
+          echo "== go.mod before =="
+          cat go.mod
+          echo "== running go mod tidy =="
+          go mod tidy -v
+          echo "== go.sum after tidy =="
+          ls -la go.sum && cat go.sum
           go mod verify
-
-      - name: Warn if go.sum/go.mod are not committed / out of date
-        run: |
           if ! git diff --quiet -- go.mod go.sum; then
-            echo "::warning::go.mod/go.sum are missing or out of date in the repo. Run 'go mod tidy' locally and commit go.sum for reproducible builds."
+            echo "::warning::go.mod/go.sum changed after 'go mod tidy'. Run it locally and commit go.sum for reproducible builds."
             git diff -- go.mod go.sum || true
           fi
+          go vet ./...
 
-      - name: Vet
-        run: go vet ./...
+      - name: Determine version info
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="0.0.0-dev+$(git rev-parse --short HEAD)"
+          fi
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
+          echo "Building ${VERSION} (${COMMIT}, ${BUILD_DATE})"
 
       - name: Build
         env:
           GOOS: linux
           GOARCH: amd64
           CGO_ENABLED: 0
+          VERSION: ${{ steps.version.outputs.version }}
+          COMMIT: ${{ steps.version.outputs.commit }}
+          BUILD_DATE: ${{ steps.version.outputs.build_date }}
         run: |
           mkdir -p dist
-          go build -v -trimpath -ldflags="-s -w" -o dist/${BINARY_NAME}-linux-amd64 .
+          go build -v -trimpath -ldflags="-s -w \
+            -X syslog-server/version.Version=${VERSION} \
+            -X syslog-server/version.Commit=${COMMIT} \
+            -X syslog-server/version.BuildDate=${BUILD_DATE}" \
+            -o dist/${BINARY_NAME}-linux-amd64 .
 
       - name: Smoke test binary
         run: |
           file dist/${BINARY_NAME}-linux-amd64
-          ./dist/${BINARY_NAME}-linux-amd64 --help || true
+          ./dist/${BINARY_NAME}-linux-amd64 -v
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -16,13 +17,21 @@ import (
 	"syslog-server/syslog"
 	"syslog-server/storage"
 	"syslog-server/types"
+	"syslog-server/version"
 	"syslog-server/websocket"
 	"syslog-server/web"
 )
 
 func main() {
 	configPath := flag.String("config", "config.json", "Path to configuration file")
+	showVersionLong := flag.Bool("version", false, "Print version information and exit")
+	showVersionShort := flag.Bool("v", false, "Print version information and exit (shorthand)")
 	flag.Parse()
+
+	if *showVersionLong || *showVersionShort {
+		fmt.Println(version.String())
+		os.Exit(0)
+	}
 
 	config, err := types.LoadConfig(*configPath)
 	if err != nil {
@@ -121,13 +130,11 @@ func main() {
 
 	syslogServer := syslog.NewServer(syslogHandler)
 
-	// Context pentru shutdown
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	defer shutdownCancel()
 
 	var wg sync.WaitGroup
 
-	// Start TCP listener cu shutdown
 	var tcpListener net.Listener
 	wg.Add(1)
 	go func() {
@@ -139,7 +146,6 @@ func main() {
 		}
 	}()
 
-	// Start UDP listener cu shutdown
 	var udpConn *net.UDPConn
 	wg.Add(1)
 	go func() {
@@ -169,20 +175,16 @@ func main() {
 	log.Printf("Syslog server listening on %s (TCP/UDP)", config.Ports.SyslogTCP)
 	log.Println("Server is ready and accepting connections!")
 
-	// Ascultă pentru semnale de închidere
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
 	log.Println("Shutting down syslog server gracefully...")
 
-	// ✅ Stop retention manager
 	retentionManager.Stop()
 
-	// 1. Cancelează context-ul pentru a opri acceptarea de conexiuni noi
 	shutdownCancel()
 
-	// 2. Închide listenerii pentru a opri imediat acceptarea conexiunilor
 	if tcpListener != nil {
 		tcpListener.Close()
 		log.Println("TCP listener closed")
@@ -192,7 +194,6 @@ func main() {
 		log.Println("UDP listener closed")
 	}
 
-	// 3. Oprește web server-ul
 	webShutdownCtx, webCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer webCancel()
 
@@ -202,7 +203,6 @@ func main() {
 		log.Println("Web server closed")
 	}
 
-	// 4. Așteaptă ca goroutine-urile să se termine (dar nu prea mult)
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -216,7 +216,6 @@ func main() {
 		log.Println("Listener shutdown timeout, continuing...")
 	}
 
-	// 5. ACUM închide storage-ul (după ce nu mai primim mesaje)
 	log.Println("Closing storage connections...")
 	if multiStorage, ok := storageBackend.(*storage.MultiStorage); ok {
 		if err := multiStorage.Close(); err != nil {
