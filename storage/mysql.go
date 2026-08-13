@@ -88,18 +88,43 @@ func NewMySQLStorage(config MySQLConfig) (*MySQLStorage, error) {
 	dsnWithoutDB := fmt.Sprintf("%s:%s@tcp(%s:%s)/?parseTime=true",
 		config.User, config.Password, config.Host, config.Port)
 
-	tempDB, err := sql.Open("mysql", dsnWithoutDB)
+	// Attempt connection with RETRY (Retry loop de siguranță la reboot)
+	maxRetries := 10
+	var tempDB *sql.DB
+	var err error
+
+	for i := 1; i <= maxRetries; i++ {
+		tempDB, err = sql.Open("mysql", dsnWithoutDB)
+		if err == nil {
+			// Încercăm un Ping fizic să fim siguri că MySQL acceptă conexiuni
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			err = tempDB.PingContext(ctx)
+			cancel()
+			if err == nil {
+				break // Conexiune reușită!
+			}
+		}
+
+		if tempDB != nil {
+			tempDB.Close()
+		}
+
+		log.Printf("⚠️ MySQL not ready yet (attempt %d/%d): %v. Retrying in 5 seconds...", i, maxRetries, err)
+		time.Sleep(5 * time.Second) // 👈 ESENȚIAL: Pauză pentru a elibera CPU-ul!
+	}
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to MySQL: %v", err)
+		return nil, fmt.Errorf("failed to connect to MySQL after %d attempts: %v", maxRetries, err)
 	}
 	defer tempDB.Close()
 
+	// 1. Creează baza de date dacă nu există
 	createDBQuery := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", config.Database)
-	_, err = tempDB.Exec(createDBQuery)
-	if err != nil {
+	if _, err := tempDB.Exec(createDBQuery); err != nil {
 		return nil, fmt.Errorf("failed to create database: %v", err)
 	}
 
+	// 2. Conectare la baza de date specifică
 	dsnWithDB := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true",
 		config.User, config.Password, config.Host, config.Port, config.Database)
 
@@ -108,15 +133,12 @@ func NewMySQLStorage(config MySQLConfig) (*MySQLStorage, error) {
 		return nil, fmt.Errorf("failed to connect to database: %v", err)
 	}
 
-	// Optimizări connection pool
+	// Connection Pool Settings
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	if err := db.Ping(); err != nil {
-		return nil, fmt.Errorf("failed to ping database: %v", err)
-	}
-
+	// 3. Verifică tabelul
 	createTableSQL := `
 	CREATE TABLE IF NOT EXISTS syslog_messages (
 		id INT AUTO_INCREMENT PRIMARY KEY,
@@ -139,15 +161,16 @@ func NewMySQLStorage(config MySQLConfig) (*MySQLStorage, error) {
 	)`
 
 	if _, err := db.Exec(createTableSQL); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("failed to create table: %v", err)
 	}
 
 	storage := &MySQLStorage{
 		db:         db,
-		countCache: NewCountCache(10 * time.Second), // Cache 10 secunde
+		countCache: NewCountCache(10 * time.Second),
 	}
 
-	// Inițializează cache-ul cu count-ul real
+	// Initializare cache
 	storage.refreshCountCache()
 
 	log.Printf("✅ MySQL storage initialized: database '%s', table 'syslog_messages'", config.Database)
