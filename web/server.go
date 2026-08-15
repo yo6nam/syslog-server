@@ -18,11 +18,6 @@ import (
 	"syslog-server/websocket"
 )
 
-// staticFiles conține tot conținutul directorului static/ înglobat direct în
-// binar la compilare. Așa serverul funcționează standalone, fără să fie
-// nevoie să cari folderul static/ alături de executabil.
-//
-//go:embed all:static
 var staticFiles embed.FS
 
 const embeddedStaticRoot = "static"
@@ -30,23 +25,21 @@ const embeddedStaticRoot = "static"
 type Server struct {
 	wsHub   *websocket.Hub
 	storage storage.Storage
-	handler interface{} // Pentru a accesa GetStats() dacă există
+	handler interface{}
 }
 
 func NewServer(wsHub *websocket.Hub, storage storage.Storage) *Server {
 	return &Server{
 		wsHub:   wsHub,
 		storage: storage,
-		handler: nil, // Se poate seta mai târziu
+		handler: nil,
 	}
 }
 
-// SetHandler setează handler-ul pentru a avea acces la statistici
 func (s *Server) SetHandler(handler interface{}) {
 	s.handler = handler
 }
 
-// SetupRoutes configurează rutele HTTP
 func (s *Server) SetupRoutes() {
 	http.Handle("/", s.buildStaticHandler())
 	http.HandleFunc("/ws", s.wsHub.ServeWebSocket)
@@ -63,11 +56,6 @@ func (s *Server) Start(addr string) error {
 	return http.ListenAndServe(addr, nil)
 }
 
-// buildStaticHandler alege sursa fișierelor UI:
-//  1. Dacă există un director ./static pe disc (lângă binar) cu un index.html,
-//     îl folosește — util pentru a personaliza UI-ul fără recompilare.
-//  2. Altfel folosește fișierele înglobate în binar la compilare (implicit),
-//     ceea ce face executabilul complet standalone.
 func (s *Server) buildStaticHandler() http.Handler {
 	if info, err := os.Stat("./static"); err == nil && info.IsDir() {
 		if _, err := os.Stat(filepath.Join("./static", "index.html")); err == nil {
@@ -87,12 +75,10 @@ func (s *Server) buildStaticHandler() http.Handler {
 	return http.FileServer(http.FS(sub))
 }
 
-// handleGetMessages returnează mesaje recente
 func (s *Server) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	// Obține parametrul limit din query string
 	limitStr := r.URL.Query().Get("limit")
 	limit := 100
 	if limitStr != "" {
@@ -101,7 +87,6 @@ func (s *Server) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Verifică dacă storage-ul suportă citirea
 	if reader, ok := s.storage.(storage.Reader); ok {
 		messages, err := reader.GetRecentMessages(limit)
 		if err != nil {
@@ -109,7 +94,6 @@ func (s *Server) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Convert messages to JSON
 		jsonData, err := json.Marshal(messages)
 		if err != nil {
 			http.Error(w, `{"error": "Failed to encode messages"}`, http.StatusInternalServerError)
@@ -122,14 +106,12 @@ func (s *Server) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleGetStats returnează statistici despre server
 func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	stats := make(map[string]interface{})
 
-	// Statistici din handler (dacă există)
 	if s.handler != nil {
 		if h, ok := s.handler.(interface{ GetStats() map[string]interface{} }); ok {
 			handlerStats := h.GetStats()
@@ -139,7 +121,6 @@ func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Adaugă statistici despre storage
 	if reader, ok := s.storage.(storage.Reader); ok {
 		if count, err := reader.GetTotalMessageCount(); err == nil {
 			stats["total_messages_stored"] = count
@@ -150,12 +131,36 @@ func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
 	w.Write(jsonData)
 }
 
-// handleSearchMessages - server-side search în toate mesajele
+func parseFlexibleTime(raw string, endOfDayIfDateOnly bool) time.Time {
+	if raw == "" {
+		return time.Time{}
+	}
+
+	preciseFormats := []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+	}
+	for _, format := range preciseFormats {
+		if t, err := time.Parse(format, raw); err == nil {
+			return t
+		}
+	}
+
+	if t, err := time.Parse("2006-01-02", raw); err == nil {
+		if endOfDayIfDateOnly {
+			t = t.Add(24*time.Hour - time.Second)
+		}
+		return t
+	}
+
+	return time.Time{}
+}
+
 func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	// Parse parametri
 	searchTerm := r.URL.Query().Get("q")
 	hostname := r.URL.Query().Get("hostname")
 	severityStr := r.URL.Query().Get("severity")
@@ -175,13 +180,11 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 		offset = 0
 	}
 
-	// Parse severity (support pentru range: range:0-4)
 	severity := -1
 	severityMax := -1
 
 	if severityStr != "" {
 		if strings.HasPrefix(severityStr, "range:") {
-			// Parse range: "range:0-4" -> severity=0, severityMax=4
 			rangeStr := strings.TrimPrefix(severityStr, "range:")
 			parts := strings.Split(rangeStr, "-")
 			if len(parts) == 2 {
@@ -189,7 +192,6 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 				severityMax, _ = strconv.Atoi(parts[1])
 			}
 		} else {
-			// Parse single severity
 			severityMap := map[string]int{
 				"emergency": 0, "alert": 1, "critical": 2, "error": 3,
 				"warning": 4, "notice": 5, "info": 6, "debug": 7,
@@ -200,23 +202,13 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Parse dates
-	var dateFromParsed, dateToParsed time.Time
-	if dateFrom != "" {
-		dateFromParsed, _ = time.Parse("2006-01-02", dateFrom)
-	}
-	if dateTo != "" {
-		dateToParsed, _ = time.Parse("2006-01-02", dateTo)
-		// Set to end of day
-		dateToParsed = dateToParsed.Add(24*time.Hour - time.Second)
-	}
+	dateFromParsed := parseFlexibleTime(dateFrom, false)
+	dateToParsed := parseFlexibleTime(dateTo, true)
 
-	// Verifică dacă storage suportă search
 	type Searcher interface {
 		SearchMessages(searchTerm string, hostname string, severity int, severityMax int, dateFrom time.Time, dateTo time.Time, limit int, offset int) ([]*types.SyslogMessage, int, error)
 	}
 
-	// Try direct assertion first
 	searcher, ok := s.storage.(Searcher)
 	if !ok {
 		log.Printf("Storage type assertion failed. Storage type: %T", s.storage)
@@ -256,12 +248,10 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 	w.Write(jsonData)
 }
 
-// handleGetMessagesPaginated - nou endpoint pentru paginare
 func (s *Server) handleGetMessagesPaginated(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	// Obține parametrii de paginare
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 
@@ -304,7 +294,6 @@ func (s *Server) handleGetMessagesPaginated(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-// handleGetMessageCount - endpoint pentru numărul total
 func (s *Server) handleGetMessageCount(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -324,7 +313,6 @@ func (s *Server) handleGetMessageCount(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleGetHistory returnează mesaje pentru o dată specificată
 func (s *Server) handleGetHistory(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")

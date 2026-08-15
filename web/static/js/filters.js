@@ -3,45 +3,47 @@ class FilterManager {
         this.client = client;
     }
 
-    applyFilters() {
-        this.client.filteredMessages = this.client.messages.filter(msg => {
-            const searchText = this.client.filters.search.toLowerCase();
-            const matchesSearch = !this.client.filters.search ||
-                (msg.content && msg.content.toLowerCase().includes(searchText)) ||
-                (msg.raw_message && msg.raw_message.toLowerCase().includes(searchText)) ||
-                (msg.tag && msg.tag.toLowerCase().includes(searchText));
+    matchesFilters(msg) {
+        const searchText = this.client.filters.search.toLowerCase();
+        const matchesSearch = !this.client.filters.search ||
+            (msg.content && msg.content.toLowerCase().includes(searchText)) ||
+            (msg.raw_message && msg.raw_message.toLowerCase().includes(searchText)) ||
+            (msg.tag && msg.tag.toLowerCase().includes(searchText));
 
-            const matchesHostname = !this.client.filters.hostname ||
-                (msg.hostname && msg.hostname.toLowerCase().includes(this.client.filters.hostname.toLowerCase()));
+        const matchesHostname = !this.client.filters.hostname ||
+            (msg.hostname && msg.hostname.toLowerCase().includes(this.client.filters.hostname.toLowerCase()));
 
-            let matchesSeverity = true;
-            if (this.client.filters.severity) {
-                if (this.client.filters.severity.startsWith('range:')) {
-                    const rangeStr = this.client.filters.severity.replace('range:', '');
-                    const [minStr, maxStr] = rangeStr.split('-');
-                    const minSev = parseInt(minStr);
-                    const maxSev = parseInt(maxStr);
+        let matchesSeverity = true;
+        if (this.client.filters.severity) {
+            if (this.client.filters.severity.startsWith('range:')) {
+                const rangeStr = this.client.filters.severity.replace('range:', '');
+                const [minStr, maxStr] = rangeStr.split('-');
+                const minSev = parseInt(minStr);
+                const maxSev = parseInt(maxStr);
 
-                    matchesSeverity = msg.severity >= minSev && msg.severity <= maxSev;
-                } else {
-                    const severityMap = {
-                        'emergency': 0, 'alert': 1, 'critical': 2, 'error': 3,
-                        'warning': 4, 'notice': 5, 'info': 6, 'debug': 7
-                    };
-                    const severityNumber = severityMap[this.client.filters.severity];
-                    matchesSeverity = msg.severity === severityNumber;
-                }
+                matchesSeverity = msg.severity >= minSev && msg.severity <= maxSev;
+            } else {
+                const severityMap = {
+                    'emergency': 0, 'alert': 1, 'critical': 2, 'error': 3,
+                    'warning': 4, 'notice': 5, 'info': 6, 'debug': 7
+                };
+                const severityNumber = severityMap[this.client.filters.severity];
+                matchesSeverity = msg.severity === severityNumber;
             }
+        }
 
-            const msgFacility = (msg.facility_string || this.client.getFacilityString(msg.facility)).toLowerCase();
-            const matchesFacility = !this.client.filters.facility ||
-                msgFacility === this.client.filters.facility.toLowerCase();
+        const msgFacility = (msg.facility_string || this.client.getFacilityString(msg.facility)).toLowerCase();
+        const matchesFacility = !this.client.filters.facility ||
+            msgFacility === this.client.filters.facility.toLowerCase();
 
-            const matchesIP = !this.client.filters.ip ||
-                (msg.remote_ip && msg.remote_ip.includes(this.client.filters.ip));
+        const matchesIP = !this.client.filters.ip ||
+            (msg.remote_ip && msg.remote_ip.includes(this.client.filters.ip));
 
-            return matchesSearch && matchesHostname && matchesSeverity && matchesFacility && matchesIP;
-        });
+        return matchesSearch && matchesHostname && matchesSeverity && matchesFacility && matchesIP;
+    }
+
+    applyFilters() {
+        this.client.filteredMessages = this.client.messages.filter(msg => this.matchesFilters(msg));
 
         this.client.uiManager?.renderMessages?.();
     }
@@ -71,12 +73,10 @@ class FilterManager {
     }
 
     applyQuickFilter(type, value) {
-        // Deschide panelul de filtre dacă e închis
         if (!this.client.showFilters) {
             this.client.uiManager?.toggleFilters?.();
         }
 
-        // Resetează toate filtrele
         this.client.filters.search = '';
         this.client.filters.hostname = '';
         this.client.filters.severity = '';
@@ -94,7 +94,6 @@ class FilterManager {
         if (severityFilter) severityFilter.value = '';
         if (highlightFilter) highlightFilter.value = '';
 
-        // Aplică filtrul specific
         switch(type) {
             case 'hostname':
                 if (hostnameFilter) hostnameFilter.value = value;

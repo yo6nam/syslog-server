@@ -3,6 +3,9 @@ class WebSocketManager {
         this.client = client;
         this.ws = null;
         this.reconnectAttempts = 0;
+        this.pendingQueue = [];
+        this.flushScheduled = false;
+        this.FLUSH_DELAY_MS = 200;
     }
 
     connect() {
@@ -17,7 +20,7 @@ class WebSocketManager {
         };
 
         this.ws.onmessage = (event) => {
-            this.handleMessage(JSON.parse(event.data));
+            this.queueMessage(JSON.parse(event.data));
         };
 
         this.ws.onclose = () => {
@@ -32,34 +35,68 @@ class WebSocketManager {
         };
     }
 
-    handleMessage(message) {
+    queueMessage(message) {
         if (this.client.searchMode) {
             return;
         }
 
-        if (!message._receivedAt) {
-            message._receivedAt = new Date().toISOString();
+        this.pendingQueue.push(message);
+
+        if (!this.flushScheduled) {
+            this.flushScheduled = true;
+            setTimeout(() => this.flushQueue(), this.FLUSH_DELAY_MS);
+        }
+    }
+
+    flushQueue() {
+        this.flushScheduled = false;
+        if (this.pendingQueue.length === 0) return;
+
+        const batch = this.pendingQueue;
+        this.pendingQueue = [];
+
+        const normalizedBatch = batch.map(message => {
+            if (!message._receivedAt) {
+                message._receivedAt = new Date().toISOString();
+            }
+            return this.client.normalizeMessage(message);
+        });
+
+        const max = this.client.pagination.maxMessages;
+
+        this.client.messages = [...normalizedBatch.slice().reverse(), ...this.client.messages];
+        this.client.pagination.total += normalizedBatch.length;
+        if (this.client.messages.length > max) {
+            this.client.messages = this.client.messages.slice(0, max);
         }
 
-        const normalizedMessage = this.client.normalizeMessage(message);
+        const filterManager = this.client.filterManager;
+        const newlyVisible = filterManager
+            ? normalizedBatch.filter(msg => filterManager.matchesFilters(msg))
+            : normalizedBatch;
 
-        this.client.messages.unshift(normalizedMessage);
-        this.client.pagination.total++;
-
-        if (this.client.messages.length > this.client.pagination.maxMessages) {
-            this.client.messages = this.client.messages.slice(0, this.client.pagination.maxMessages);
+        if (newlyVisible.length > 0) {
+            this.client.filteredMessages = [...newlyVisible.slice().reverse(), ...this.client.filteredMessages];
+            if (this.client.filteredMessages.length > max) {
+                this.client.filteredMessages = this.client.filteredMessages.slice(0, max);
+            }
         }
 
-        this.client.filterManager?.applyFilters?.();
         this.client.updateStats();
         this.client.updateTimestamps?.();
 
-        if (!document.getElementById('fullscreenLogs').classList.contains('hidden')) {
-            this.client.fullscreenManager?.updateFullscreenDisplay?.();
+        if (this.client.autoScroll) {
+            if (newlyVisible.length > 0) {
+                this.client.uiManager?.prependMessages?.(newlyVisible.slice().reverse());
+            }
+        } else {
+            this.client.pendingNewCount = (this.client.pendingNewCount || 0) + newlyVisible.length;
+            this.client.uiManager?.updateNewMessagesIndicator?.();
         }
 
-        if (this.client.autoScroll) {
-            setTimeout(() => this.client.scrollToTop(), 50);
+        const fullscreenLogs = document.getElementById('fullscreenLogs');
+        if (fullscreenLogs && !fullscreenLogs.classList.contains('hidden')) {
+            this.client.fullscreenManager?.updateFullscreenDisplay?.();
         }
     }
 

@@ -110,6 +110,7 @@
                 <input type="date" id="searchDateTo" class="filter-input" placeholder="To date">
 
                 <button class="btn" onclick="performSearch()">Search</button>
+                <button class="btn" onclick="searchLast24Hours()" title="Ultimele 24h, fereastră glisantă — nu aliniată la miezul nopții">Last 24h</button>
                 <button class="btn clear" onclick="clearSearch()">Clear Search</button>
 
                 <span id="searchResults" style="margin-left: 10px; color: #888;"></span>
@@ -117,6 +118,7 @@
         </div>
 
         <div class="messages" id="messagesContainer">
+            <button id="newMessagesIndicator" class="new-messages-indicator hidden" onclick="jumpToLatest()">↓ New messages</button>
             <div id="messagesList"></div>
         </div>
     </div>

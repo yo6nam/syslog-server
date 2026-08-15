@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,12 +30,12 @@ type FileStorage struct {
 	readMutex  sync.RWMutex
 
 	// 🚀 CACHE IN-MEMORY
-	recentCache    []*types.SyslogMessage
-	maxRecentCache int
+	recentCache     []*types.SyslogMessage
+	maxRecentCache  int
 	totalCountCache int
-	countCachedAt  time.Time
-	countCacheTTL  time.Duration
-	cacheMutex     sync.RWMutex
+	countCachedAt   time.Time
+	countCacheTTL   time.Duration
+	cacheMutex      sync.RWMutex
 }
 
 func NewFileStorage(baseDir string) (*FileStorage, error) {
@@ -44,28 +45,24 @@ func NewFileStorage(baseDir string) (*FileStorage, error) {
 
 	fs := &FileStorage{
 		baseDir:        baseDir,
-		maxRecentCache: 500,              // Păstrăm ultimele 500 mesaje direct în memorie
-		countCacheTTL:  30 * time.Second, // Recalculăm de pe disc la fiecare 30 sec doar dacă e nevoie
+		maxRecentCache: 500,
+		countCacheTTL:  30 * time.Second,
 	}
 
-	// Warmup cache la pornire
 	go fs.warmupCache()
 
 	return fs, nil
 }
 
-// warmupCache populează cache-ul la pornirea aplicației
 func (fs *FileStorage) warmupCache() {
 	fs.cacheMutex.Lock()
 	defer fs.cacheMutex.Unlock()
 
-	// Populează ultimele mesaje
 	messages, err := fs.loadRecentFromDisk(fs.maxRecentCache)
 	if err == nil {
 		fs.recentCache = messages
 	}
 
-	// Calculează count-ul inițial
 	count, err := fs.countFromDisk()
 	if err == nil {
 		fs.totalCountCache = count
@@ -102,7 +99,6 @@ func (fs *FileStorage) Store(message *types.SyslogMessage) error {
 	}
 	file.Close()
 
-	// 2. Scriere pe disc (JSON Entry)
 	jsonFilename := fmt.Sprintf("syslog-%s.json", message.Timestamp.Format("2006-01-02"))
 	jsonFilePath := filepath.Join(fs.baseDir, jsonFilename)
 
@@ -132,14 +128,12 @@ func (fs *FileStorage) Store(message *types.SyslogMessage) error {
 		return err
 	}
 
-	// 3. 🚀 UPDATE IN-MEMORY CACHE (Instantaneu, fără Disk I/O)
 	fs.cacheMutex.Lock()
-	// Prepend mesajul nou la începutul fâșiei
 	fs.recentCache = append([]*types.SyslogMessage{message}, fs.recentCache...)
 	if len(fs.recentCache) > fs.maxRecentCache {
 		fs.recentCache = fs.recentCache[:fs.maxRecentCache]
 	}
-	// Incrementează contorul total
+
 	fs.totalCountCache++
 	fs.cacheMutex.Unlock()
 
@@ -150,11 +144,9 @@ func (fs *FileStorage) Close() error {
 	return nil
 }
 
-// GetRecentMessages returnează ultimele N mesaje din CACHE (Dacă e posibil)
 func (fs *FileStorage) GetRecentMessages(limit int) ([]*types.SyslogMessage, error) {
 	fs.cacheMutex.RLock()
 	if len(fs.recentCache) >= limit {
-		// Slice copy pentru a preveni race conditions
 		result := make([]*types.SyslogMessage, limit)
 		copy(result, fs.recentCache[:limit])
 		fs.cacheMutex.RUnlock()
@@ -162,11 +154,9 @@ func (fs *FileStorage) GetRecentMessages(limit int) ([]*types.SyslogMessage, err
 	}
 	fs.cacheMutex.RUnlock()
 
-	// Fallback la citire de pe disc doar dacă cache-ul are mai puține mesaje decât cererea
 	return fs.loadRecentFromDisk(limit)
 }
 
-// GetTotalMessageCount returnează numărul total de mesaje din Cache
 func (fs *FileStorage) GetTotalMessageCount() (int, error) {
 	fs.cacheMutex.RLock()
 	if time.Since(fs.countCachedAt) < fs.countCacheTTL && fs.totalCountCache > 0 {
@@ -176,7 +166,6 @@ func (fs *FileStorage) GetTotalMessageCount() (int, error) {
 	}
 	fs.cacheMutex.RUnlock()
 
-	// Recalculează de pe disc dacă e primul apel / expiră TTL
 	count, err := fs.countFromDisk()
 	if err != nil {
 		return 0, err
@@ -190,14 +179,12 @@ func (fs *FileStorage) GetTotalMessageCount() (int, error) {
 	return count, nil
 }
 
-// GetMessagesPaginated folosește cache-ul pentru prima pagină sau citește optimizat
 func (fs *FileStorage) GetMessagesPaginated(offset, limit int) ([]*types.SyslogMessage, int, error) {
 	total, err := fs.GetTotalMessageCount()
 	if err != nil {
 		return nil, 0, err
 	}
 
-	// 🚀 Scurtcircuitare: Dacă cere prima pagină și intra în recentCache
 	fs.cacheMutex.RLock()
 	if offset == 0 && limit <= len(fs.recentCache) {
 		result := make([]*types.SyslogMessage, limit)
@@ -207,7 +194,6 @@ func (fs *FileStorage) GetMessagesPaginated(offset, limit int) ([]*types.SyslogM
 	}
 	fs.cacheMutex.RUnlock()
 
-	// Fallback de pe disc pentru pagini vechi
 	fs.readMutex.RLock()
 	defer fs.readMutex.RUnlock()
 
@@ -219,7 +205,6 @@ func (fs *FileStorage) GetMessagesPaginated(offset, limit int) ([]*types.SyslogM
 
 	sort.Sort(sort.Reverse(sort.StringSlice(files)))
 
-	// Colectăm doar până la offset + limit pentru a nu încărca TOATE fișierele vechi
 	needed := offset + limit
 	for _, file := range files {
 		messages, err := fs.readJSONFileUnsafe(file)
@@ -259,7 +244,96 @@ func (fs *FileStorage) GetMessagesByDate(date time.Time) ([]*types.SyslogMessage
 	return fs.readJSONFileUnsafe(filePath)
 }
 
-// Helper: Încarcă mesaje recente de pe disc (pentru fallback sau warmup)
+func (fs *FileStorage) SearchMessages(searchTerm string, hostname string, severity int, severityMax int, dateFrom time.Time, dateTo time.Time, limit int, offset int) ([]*types.SyslogMessage, int, error) {
+	fs.readMutex.RLock()
+	defer fs.readMutex.RUnlock()
+
+	var candidateFiles []string
+
+	if !dateFrom.IsZero() && !dateTo.IsZero() {
+		start := time.Date(dateFrom.Year(), dateFrom.Month(), dateFrom.Day(), 0, 0, 0, 0, dateFrom.Location())
+		for d := start; !d.After(dateTo); d = d.AddDate(0, 0, 1) {
+			filename := fmt.Sprintf("syslog-%s.json", d.Format("2006-01-02"))
+			candidateFiles = append(candidateFiles, filepath.Join(fs.baseDir, filename))
+		}
+	} else {
+		files, err := filepath.Glob(filepath.Join(fs.baseDir, "syslog-*.json"))
+		if err != nil {
+			return nil, 0, err
+		}
+		candidateFiles = files
+	}
+
+	sort.Sort(sort.Reverse(sort.StringSlice(candidateFiles)))
+
+	searchTermLower := strings.ToLower(searchTerm)
+	hostnameLower := strings.ToLower(hostname)
+
+	var matched []*types.SyslogMessage
+	for _, file := range candidateFiles {
+		messages, err := fs.readJSONFileUnsafe(file)
+		if err != nil {
+			continue
+		}
+
+		for _, msg := range messages {
+			if !dateFrom.IsZero() && msg.Timestamp.Before(dateFrom) {
+				continue
+			}
+			if !dateTo.IsZero() && msg.Timestamp.After(dateTo) {
+				continue
+			}
+			if searchTerm != "" {
+				contentMatch := strings.Contains(strings.ToLower(msg.Content), searchTermLower)
+				rawMatch := strings.Contains(strings.ToLower(msg.RawMessage), searchTermLower)
+				if !contentMatch && !rawMatch {
+					continue
+				}
+			}
+			if hostname != "" && !strings.Contains(strings.ToLower(msg.Hostname), hostnameLower) {
+				continue
+			}
+			if severity >= 0 && severityMax >= 0 {
+				if msg.Severity < severity || msg.Severity > severityMax {
+					continue
+				}
+			} else if severity >= 0 && severity <= 7 {
+				if msg.Severity != severity {
+					continue
+				}
+			}
+
+			matched = append(matched, msg)
+		}
+	}
+
+	sort.Slice(matched, func(i, j int) bool {
+		return matched[i].Timestamp.After(matched[j].Timestamp)
+	})
+
+	total := len(matched)
+
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+
+	end := offset + limit
+	if offset > total {
+		return []*types.SyslogMessage{}, total, nil
+	}
+	if end > total {
+		end = total
+	}
+
+	return matched[offset:end], total, nil
+}
+
 func (fs *FileStorage) loadRecentFromDisk(limit int) ([]*types.SyslogMessage, error) {
 	fs.readMutex.RLock()
 	defer fs.readMutex.RUnlock()
@@ -295,7 +369,6 @@ func (fs *FileStorage) loadRecentFromDisk(limit int) ([]*types.SyslogMessage, er
 	return allMessages, nil
 }
 
-// Helper: Numără mesajele de pe disc
 func (fs *FileStorage) countFromDisk() (int, error) {
 	fs.readMutex.RLock()
 	defer fs.readMutex.RUnlock()

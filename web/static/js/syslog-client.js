@@ -6,13 +6,11 @@ class SyslogClient {
         this.autoScroll = true;
         this.startTime = Date.now();
 
-        // Încarcă preferințe din localStorage
         this.showRawMessage = this.loadPreference('showRawMessage', true);
         this.showFilters = this.loadPreference('showFilters', false);
         this.showSearch = false;
         this.searchMode = false;
 
-        // Filtre
         this.filters = {
             search: '',
             hostname: '',
@@ -22,18 +20,18 @@ class SyslogClient {
             highlight: ''
         };
 
-        // Paginare
         this.pagination = {
             offset: 0,
-            limit: 100,
+            limit: 500,
             total: 0,
             isLoading: false,
             hasMore: true,
             initialLoad: true,
-            maxMessages: 1000
+            maxMessages: 5000
         };
 
-        // Fullscreen
+        this.pendingNewCount = 0;
+
         this.fullscreenAutoScroll = true;
         this.fullscreenFilters = {
             search: '',
@@ -43,7 +41,6 @@ class SyslogClient {
         };
     }
 
-    // === METODE DE UTILITATE ===
     loadPreference(key, defaultValue) {
         try {
             const saved = localStorage.getItem(key);
@@ -159,7 +156,6 @@ class SyslogClient {
         return facilities[facilityCode] || 'unknown';
     }
 
-    // === METODE DE BAZĂ ===
     scrollToTop() {
         const container = document.getElementById('messagesContainer');
         if (container) {
@@ -182,13 +178,11 @@ class SyslogClient {
 	    const seconds = String(now.getSeconds()).padStart(2, '0');
 	    const timestamp = `${hours}:${minutes}:${seconds}`;
 
-	    // Update în view-ul principal
 	    const mainUpdateElement = document.getElementById('lastUpdate');
 	    if (mainUpdateElement) {
 	        mainUpdateElement.textContent = timestamp;
 	    }
 
-	    // Update în fullscreen (dacă elementul există)
 	    const fullscreenUpdateElement = document.getElementById('fullscreenLastUpdate');
 	    if (fullscreenUpdateElement) {
 	        fullscreenUpdateElement.textContent = timestamp;
@@ -211,7 +205,6 @@ class SyslogClient {
     }
 
     async loadMoreMessages() {
-        // Dacă suntem în search mode, folosește search pagination
         if (this.searchMode && this.searchManager) {
             return this.searchManager.performSearch(true);
         }
@@ -220,7 +213,6 @@ class SyslogClient {
             return;
         }
 
-        // Limită de mesaje în memorie
         if (this.messages.length >= this.pagination.maxMessages) {
             console.warn(`Reached maximum message limit (${this.pagination.maxMessages})`);
             this.pagination.hasMore = false;
@@ -244,7 +236,6 @@ class SyslogClient {
                 this.messages = [...this.messages, ...normalizedMessages];
                 this.pagination.total = paginationInfo.total || this.pagination.total;
 
-                // Verifică limita
                 const remainingSlots = this.pagination.maxMessages - this.messages.length;
                 this.pagination.hasMore = (this.pagination.offset + newMessages.length) < this.pagination.total && remainingSlots > 0;
                 this.pagination.offset += newMessages.length;
@@ -291,26 +282,37 @@ class SyslogClient {
         }
 
         if (this.autoScroll) {
-            this.scrollToTop();
+            this.resumeLive();
         }
     }
 
+    resumeLive() {
+        this.pendingNewCount = 0;
+        this.uiManager?.renderMessages?.();
+        this.uiManager?.updateNewMessagesIndicator?.();
+        this.scrollToTop();
+    }
+
+    jumpToLatest() {
+        this.autoScroll = true;
+        const statusElement = document.getElementById('autoScrollStatus');
+        if (statusElement) {
+            statusElement.textContent = 'On';
+        }
+        this.resumeLive();
+    }
+
 	exportMessages() {
-	    // Determină ce mesaje să exporte
 	    let messagesToExport;
 
 	    if (this.searchMode && this.messages.length > 0) {
-	        // În modul search, exportă mesajele din search
 	        messagesToExport = this.messages;
 	    } else if (this.filteredMessages.length > 0) {
-	        // Altfel, exportă mesajele filtrate
 	        messagesToExport = this.filteredMessages;
 	    } else {
-	        // Fallback la toate mesajele
 	        messagesToExport = this.messages;
 	    }
 
-	    // Creează obiectul pentru export cu metadate
 	    const exportData = {
 	        meta: {
 	            exported_at: new Date().toISOString(),
@@ -346,7 +348,6 @@ class SyslogClient {
 	    const link = document.createElement('a');
 	    link.href = URL.createObjectURL(dataBlob);
 
-	    // Nume de fișier diferit pentru search vs normal
 	    const dateStr = new Date().toISOString().split('T')[0];
 	    const mode = this.searchMode ? 'search' : 'live';
 	    link.download = `syslog-export-${mode}-${dateStr}.json`;
@@ -354,7 +355,6 @@ class SyslogClient {
 	    link.click();
 	    URL.revokeObjectURL(link.href);
 
-	    // Feedback visual
 	    this.showExportToast(messagesToExport.length, this.searchMode);
 	}
 
@@ -382,7 +382,6 @@ class SyslogClient {
 	    }, 3000);
 	}
 
-    // === METODE DELEGATE === (pentru manageri)
     applyFilters() {
         this.filterManager?.applyFilters?.();
     }

@@ -1,19 +1,54 @@
 class SearchManager {
     constructor(client) {
         this.client = client;
+        this._lastCriteria = null;
+        this._lastDateLabel = null;
     }
 
     async performSearch(loadMore = false) {
-        const searchTerm = document.getElementById('searchAllInput').value;
-        const hostname = document.getElementById('searchAllHostname').value;
-        const severity = document.getElementById('searchAllSeverity').value;
-        const dateFrom = document.getElementById('searchDateFrom').value;
-        const dateTo = document.getElementById('searchDateTo').value;
+        let criteria;
 
-        if (!loadMore && !searchTerm && !hostname && !severity && !dateFrom && !dateTo) {
-            alert('Please enter at least one search criteria');
-            return;
+        if (loadMore && this._lastCriteria) {
+            criteria = this._lastCriteria;
+        } else {
+            criteria = {
+                searchTerm: document.getElementById('searchAllInput').value,
+                hostname: document.getElementById('searchAllHostname').value,
+                severity: document.getElementById('searchAllSeverity').value,
+                dateFrom: document.getElementById('searchDateFrom').value,
+                dateTo: document.getElementById('searchDateTo').value,
+            };
+
+            if (!criteria.searchTerm && !criteria.hostname && !criteria.severity && !criteria.dateFrom && !criteria.dateTo) {
+                alert('Please enter at least one search criteria');
+                return;
+            }
         }
+
+        await this.executeSearch(criteria, loadMore, loadMore ? this._lastDateLabel : null);
+    }
+
+    async searchLast24Hours() {
+        const now = new Date();
+        const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+        const searchDateFrom = document.getElementById('searchDateFrom');
+        const searchDateTo = document.getElementById('searchDateTo');
+        if (searchDateFrom) searchDateFrom.value = '';
+        if (searchDateTo) searchDateTo.value = '';
+
+        const criteria = {
+            searchTerm: '',
+            hostname: '',
+            severity: '',
+            dateFrom: yesterday.toISOString(),
+            dateTo: now.toISOString(),
+        };
+
+        await this.executeSearch(criteria, false, 'Last 24 hours');
+    }
+
+    async executeSearch(criteria, loadMore, dateLabel) {
+        const { searchTerm, hostname, severity, dateFrom, dateTo } = criteria;
 
         this.client.searchMode = true;
         this.client.pagination.isLoading = true;
@@ -23,6 +58,8 @@ class SearchManager {
             const searchBanner = document.getElementById('searchModeBanner');
             if (searchBanner) searchBanner.classList.remove('hidden');
             this.client.pagination.offset = 0;
+            this._lastCriteria = criteria;
+            this._lastDateLabel = dateLabel || null;
         }
 
         try {
@@ -32,7 +69,7 @@ class SearchManager {
                 severity: severity || '',
                 date_from: dateFrom || '',
                 date_to: dateTo || '',
-                limit: 100,
+                limit: 500,
                 offset: loadMore ? this.client.pagination.offset : 0
             });
 
@@ -59,10 +96,10 @@ class SearchManager {
                 this.client.updateStats();
                 this.client.updateTimestamps?.();
 
-                this.updateSearchResultsUI(total, dateFrom, dateTo);
+                this.updateSearchResultsUI(total, dateLabel, dateFrom, dateTo);
 
                 if (!loadMore) {
-                    this.updateSearchBanner(searchTerm, hostname, severity, dateFrom, dateTo);
+                    this.updateSearchBanner(searchTerm, hostname, severity, dateLabel, dateFrom, dateTo);
                 }
             } else {
                 const errorText = await response.text();
@@ -77,12 +114,14 @@ class SearchManager {
         }
     }
 
-    updateSearchResultsUI(total, dateFrom, dateTo) {
+    updateSearchResultsUI(total, dateLabel, dateFrom, dateTo) {
         let resultsText = `Found ${total} message(s)`;
         if (this.client.messages.length < total) {
             resultsText += ` (showing ${this.client.messages.length})`;
         }
-        if (dateFrom || dateTo) {
+        if (dateLabel) {
+            resultsText += ` | ${dateLabel}`;
+        } else if (dateFrom || dateTo) {
             resultsText += ` | ${dateFrom || 'start'} to ${dateTo || 'now'}`;
         }
 
@@ -92,14 +131,18 @@ class SearchManager {
         }
     }
 
-    updateSearchBanner(searchTerm, hostname, severity, dateFrom, dateTo) {
+    updateSearchBanner(searchTerm, hostname, severity, dateLabel, dateFrom, dateTo) {
         const criteriaEl = document.getElementById('searchCriteria');
         if (criteriaEl) {
             let criteria = [];
             if (searchTerm) criteria.push(`Text: "${searchTerm}"`);
             if (hostname) criteria.push(`Host: "${hostname}"`);
             if (severity) criteria.push(`Severity: ${severity}`);
-            if (dateFrom || dateTo) criteria.push(`Date: ${dateFrom || 'start'} → ${dateTo || 'now'}`);
+            if (dateLabel) {
+                criteria.push(`Date: ${dateLabel}`);
+            } else if (dateFrom || dateTo) {
+                criteria.push(`Date: ${dateFrom || 'start'} → ${dateTo || 'now'}`);
+            }
 
             criteriaEl.textContent = criteria.length > 0 ? criteria.join(' | ') : 'Live updates paused';
         }
@@ -107,6 +150,8 @@ class SearchManager {
 
     clearSearch() {
         this.client.searchMode = false;
+        this._lastCriteria = null;
+        this._lastDateLabel = null;
 
         const searchAllInput = document.getElementById('searchAllInput');
         const searchAllHostname = document.getElementById('searchAllHostname');

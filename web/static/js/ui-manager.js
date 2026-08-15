@@ -3,6 +3,57 @@ class UIManager {
         this.client = client;
     }
 
+    renderRowHtml(msg) {
+        const timestamp = this.client.formatTimestamp(msg.timestamp);
+        const hostname = msg.hostname || 'unknown';
+        const tag = msg.tag || '';
+
+        const severityNumber = msg.severity;
+        const severityMap = {
+            0: 'emergency',
+            1: 'alert',
+            2: 'critical',
+            3: 'error',
+            4: 'warning',
+            5: 'notice',
+            6: 'info',
+            7: 'debug'
+        };
+        const severity = severityMap[severityNumber] || 'unknown';
+        const severityDisplay = severity.toUpperCase();
+
+        const facility = msg.facility_string || this.client.getFacilityString(msg.facility);
+        const facilityDisplay = facility.toUpperCase();
+
+        const protocol = msg.protocol || '';
+        const protocolPrefix = protocol && protocol !== 'N/A' ? `[${protocol}] ` : '';
+
+        const remoteIp = msg.remote_ip || 'N/A';
+
+        const content = this.client.applyHighlight(msg.content || 'No content', this.client.filters.highlight);
+        const rawMessage = msg.raw_message || '';
+
+        let rawMessageHtml = '';
+        if (this.client.showRawMessage && rawMessage && rawMessage !== msg.content) {
+            const highlightedRawMessage = this.client.applyHighlight(rawMessage, this.client.filters.highlight);
+            rawMessageHtml = `<div style="margin-top: 5px; font-size: 11px; color: #888; font-family: monospace;">${highlightedRawMessage}</div>`;
+        }
+
+        return `
+            <div class="message">
+                <div class="message-header">
+                    <span class="timestamp">${timestamp}</span>
+                    <span class="hostname clickable-filter" data-type="hostname" data-value="${this.client.escapeHtml(hostname)}" title="Filter by ${hostname}">${hostname}</span>
+                    ${tag ? `<span class="tag clickable-filter" data-type="tag" data-value="${this.client.escapeHtml(tag)}" title="Filter by ${tag}">${tag}</span>` : ''}
+                    <span class="facility ${facility} clickable-filter" data-type="facility" data-value="${facility}" title="Filter by ${facilityDisplay}">${facilityDisplay}</span>
+                    <span class="severity ${severity}">${severityDisplay}</span>
+                    <span class="remote-ip clickable-filter" data-type="ip" data-value="${this.client.escapeHtml(remoteIp)}" title="Filter by ${remoteIp}" style="margin-left: auto; color: #888; font-size: 12px;">${protocolPrefix}${remoteIp}</span>
+                </div>
+                <div class="content">${content}</div>
+                ${rawMessageHtml}
+            </div>`;
+    }
+
     renderMessages() {
         const container = document.getElementById('messagesList');
         if (!container) return;
@@ -16,56 +67,7 @@ class UIManager {
             return;
         }
 
-        container.innerHTML = this.client.filteredMessages.map(msg => {
-            const timestamp = this.client.formatTimestamp(msg.timestamp);
-            const hostname = msg.hostname || 'unknown';
-            const tag = msg.tag || '';
-
-            const severityNumber = msg.severity;
-            const severityMap = {
-                0: 'emergency',
-                1: 'alert',
-                2: 'critical',
-                3: 'error',
-                4: 'warning',
-                5: 'notice',
-                6: 'info',
-                7: 'debug'
-            };
-            const severity = severityMap[severityNumber] || 'unknown';
-            const severityDisplay = severity.toUpperCase();
-
-            const facility = msg.facility_string || this.client.getFacilityString(msg.facility);
-            const facilityDisplay = facility.toUpperCase();
-
-            const protocol = msg.protocol || '';
-            const protocolPrefix = protocol && protocol !== 'N/A' ? `[${protocol}] ` : '';
-
-            const remoteIp = msg.remote_ip || 'N/A';
-
-            const content = this.client.applyHighlight(msg.content || 'No content', this.client.filters.highlight);
-            const rawMessage = msg.raw_message || '';
-
-            let rawMessageHtml = '';
-            if (this.client.showRawMessage && rawMessage && rawMessage !== msg.content) {
-                const highlightedRawMessage = this.client.applyHighlight(rawMessage, this.client.filters.highlight);
-                rawMessageHtml = `<div style="margin-top: 5px; font-size: 11px; color: #888; font-family: monospace;">${highlightedRawMessage}</div>`;
-            }
-
-            return `
-			<div class="message">
-			    <div class="message-header">
-			        <span class="timestamp">${timestamp}</span>
-			        <span class="hostname clickable-filter" data-type="hostname" data-value="${this.client.escapeHtml(hostname)}" title="Filter by ${hostname}">${hostname}</span>
-			        ${tag ? `<span class="tag clickable-filter" data-type="tag" data-value="${this.client.escapeHtml(tag)}" title="Filter by ${tag}">${tag}</span>` : ''}
-			        <span class="facility ${facility} clickable-filter" data-type="facility" data-value="${facility}" title="Filter by ${facilityDisplay}">${facilityDisplay}</span>
-			        <span class="severity ${severity}">${severityDisplay}</span>
-			        <span class="remote-ip clickable-filter" data-type="ip" data-value="${this.client.escapeHtml(remoteIp)}" title="Filter by ${remoteIp}" style="margin-left: auto; color: #888; font-size: 12px;">${protocolPrefix}${remoteIp}</span>
-			    </div>
-			    <div class="content">${content}</div>
-			    ${rawMessageHtml}
-			</div>`;
-        }).join('');
+        container.innerHTML = this.client.filteredMessages.map(msg => this.renderRowHtml(msg)).join('');
 
         this.setupClickableFilters();
 
@@ -74,8 +76,35 @@ class UIManager {
         }
     }
 
-    setupClickableFilters() {
-        document.querySelectorAll('.clickable-filter').forEach(el => {
+    prependMessages(newMessages) {
+        const container = document.getElementById('messagesList');
+        if (!container || !newMessages || newMessages.length === 0) return;
+
+        if (this.client.filteredMessages.length === newMessages.length) {
+            this.renderMessages();
+            return;
+        }
+
+        const html = newMessages.map(msg => this.renderRowHtml(msg)).join('');
+        container.insertAdjacentHTML('afterbegin', html);
+
+        for (let i = 0; i < newMessages.length; i++) {
+            const node = container.children[i];
+            if (node) this.attachClickableFilterHandlers(node);
+        }
+
+        const max = this.client.pagination.maxMessages;
+        while (container.children.length > max) {
+            container.removeChild(container.lastElementChild);
+        }
+
+        if (this.client.autoScroll) {
+            setTimeout(() => this.client.scrollToTop(), 50);
+        }
+    }
+
+    attachClickableFilterHandlers(scope) {
+        scope.querySelectorAll('.clickable-filter').forEach(el => {
             el.addEventListener('click', (e) => {
                 e.stopPropagation();
                 this.client.filterManager?.applyQuickFilter?.(
@@ -84,6 +113,24 @@ class UIManager {
                 );
             });
         });
+    }
+
+    setupClickableFilters() {
+        const container = document.getElementById('messagesList');
+        if (container) this.attachClickableFilterHandlers(container);
+    }
+
+    updateNewMessagesIndicator() {
+        const indicator = document.getElementById('newMessagesIndicator');
+        if (!indicator) return;
+
+        const count = this.client.pendingNewCount || 0;
+        if (count > 0 && !this.client.autoScroll) {
+            indicator.textContent = `↓ ${count} new message${count > 1 ? 's' : ''}`;
+            indicator.classList.remove('hidden');
+        } else {
+            indicator.classList.add('hidden');
+        }
     }
 
     updateLoadMoreButton() {

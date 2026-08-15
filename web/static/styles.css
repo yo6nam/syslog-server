@@ -182,16 +182,47 @@ body {
     overflow: hidden;
     max-height: 600px;
     overflow-y: auto;
+    position: relative;
 }
 
 .message {
     padding: 12px 15px;
     border-bottom: 1px solid #404040;
     transition: background 0.2s;
+    content-visibility: auto;
+    contain-intrinsic-size: 70px;
 }
 
 .message:hover {
     background: #363636;
+}
+
+.new-messages-indicator {
+    position: sticky;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 5;
+    display: block;
+    width: fit-content;
+    margin: 0 auto 8px;
+    padding: 6px 16px;
+    background: #4a9eff;
+    color: #fff;
+    border: none;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.new-messages-indicator:hover {
+    background: #3a8eef;
+}
+
+.new-messages-indicator.hidden {
+    display: none;
 }
 
 .message-header {
@@ -297,7 +328,7 @@ body {
 
 /* Highlight styling */
 .highlight {
-    background-color: #ffeb3b; /* Galben strălucitor */
+    background-color: #ffeb3b;
     color: #000;
     padding: 1px 3px;
     border-radius: 3px;
@@ -305,9 +336,8 @@ body {
     box-shadow: 0 0 3px rgba(255, 235, 59, 0.5);
 }
 
-/* Pentru tema întunecată, poți folosi și alte culori */
 .highlight.dark {
-    background-color: #ff9800; /* Orange pentru tema dark */
+    background-color: #ff9800;
     color: #fff;
 }
 

@@ -104,6 +104,7 @@ class App {
                     if (statusElement) {
                         statusElement.textContent = 'On';
                     }
+                    this.client.resumeLive();
                 }
             });
         }
@@ -142,6 +143,12 @@ function toggleAutoScroll() {
     }
 }
 
+function jumpToLatest() {
+    if (app && app.client) {
+        app.client.jumpToLatest();
+    }
+}
+
 function exportMessages() {
     if (app && app.client) {
         app.client.exportMessages();
@@ -175,6 +182,12 @@ function toggleSearch() {
 function performSearch() {
     if (app && app.searchManager) {
         app.searchManager.performSearch();
+    }
+}
+
+function searchLast24Hours() {
+    if (app && app.searchManager) {
+        app.searchManager.searchLast24Hours();
     }
 }
 
