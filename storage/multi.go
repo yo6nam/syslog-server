@@ -11,6 +11,7 @@ import (
 type MultiStorage struct {
 	backends []Storage
 	mysql    *MySQLStorage
+	file     *FileStorage
 	mutex    sync.Mutex
 }
 
@@ -22,7 +23,9 @@ func NewMultiStorage(backends ...Storage) *MultiStorage {
 	for _, backend := range backends {
 		if mysqlBackend, ok := backend.(*MySQLStorage); ok {
 			ms.mysql = mysqlBackend
-			break
+		}
+		if fileBackend, ok := backend.(*FileStorage); ok {
+			ms.file = fileBackend
 		}
 	}
 

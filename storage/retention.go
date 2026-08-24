@@ -138,11 +138,32 @@ func (rm *RetentionManager) deleteOldMessages(cutoffDate time.Time) (int, error)
 		return mysqlStorage.DeleteOldMessages(cutoffDate)
 	}
 
+	if fileStorage, ok := rm.storage.(*FileStorage); ok {
+		return fileStorage.DeleteOldMessages(cutoffDate)
+	}
+
 	if multiStorage, ok := rm.storage.(*MultiStorage); ok {
-		// Dacă e MultiStorage, șterge din MySQL
+		// Curăță AMBELE backend-uri active, nu doar MySQL — altfel file storage
+		// acumulează la nesfârșit chiar și când retenția e "activă".
+		total := 0
+		var firstErr error
+
 		if multiStorage.mysql != nil {
-			return multiStorage.mysql.DeleteOldMessages(cutoffDate)
+			n, err := multiStorage.mysql.DeleteOldMessages(cutoffDate)
+			total += n
+			if err != nil {
+				firstErr = fmt.Errorf("mysql: %w", err)
+			}
 		}
+		if multiStorage.file != nil {
+			n, err := multiStorage.file.DeleteOldMessages(cutoffDate)
+			total += n
+			if err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("file: %w", err)
+			}
+		}
+
+		return total, firstErr
 	}
 
 	return 0, fmt.Errorf("storage backend does not support cleanup")

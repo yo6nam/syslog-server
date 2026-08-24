@@ -451,6 +451,16 @@ func (ms *MySQLStorage) SearchMessages(searchTerm string, hostname string, sever
         LIMIT ? OFFSET ?
     `, whereClause)
 
+    if offset < 0 {
+        offset = 0
+    }
+    if limit <= 0 {
+        limit = 100
+    }
+    if limit > 5000 {
+        limit = 5000
+    }
+
     // Adaugă limit/offset la args
     args = append(args, limit, offset)
 
@@ -478,26 +488,43 @@ func (ms *MySQLStorage) SearchMessages(searchTerm string, hostname string, sever
     return messages, totalCount, nil
 }
 
-// DeleteOldMessages șterge mesajele mai vechi decât cutoffDate
+// DeleteOldMessages șterge mesajele mai vechi decât cutoffDate, în loturi mici
+// (nu un singur DELETE nemărginit) — pe un tabel foarte mare, un DELETE dintr-o
+// bucată poate ține un lock lung și un transaction log uriaș, blocând
+// temporar INSERT-urile live (ingestia de syslog). Loturile mici + o pauză
+// scurtă între ele lasă traficul live să intre între iterații.
 func (ms *MySQLStorage) DeleteOldMessages(cutoffDate time.Time) (int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	const batchSize = 5000
+	totalDeleted := 0
 
-	query := `DELETE FROM syslog_messages WHERE timestamp < ?`
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		result, err := ms.db.ExecContext(ctx,
+			`DELETE FROM syslog_messages WHERE timestamp < ? LIMIT ?`,
+			cutoffDate, batchSize)
+		cancel()
 
-	result, err := ms.db.ExecContext(ctx, query, cutoffDate)
-	if err != nil {
-		return 0, fmt.Errorf("failed to delete old messages: %v", err)
-	}
+		if err != nil {
+			return totalDeleted, fmt.Errorf("failed to delete old messages: %v", err)
+		}
 
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("failed to get rows affected: %v", err)
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return totalDeleted, fmt.Errorf("failed to get rows affected: %v", err)
+		}
+
+		totalDeleted += int(rowsAffected)
+
+		if rowsAffected < batchSize {
+			break // am șters tot ce era mai vechi decât cutoff
+		}
+
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	// Invalidează cache-ul după ștergere
 	ms.countCache.Set(0)
 	ms.refreshCountCache()
 
-	return int(rowsAffected), nil
+	return totalDeleted, nil
 }

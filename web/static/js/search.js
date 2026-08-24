@@ -9,6 +9,10 @@ class SearchManager {
         let criteria;
 
         if (loadMore && this._lastCriteria) {
+            // "Load more" refolosește EXACT criteriile ultimei căutări, nu
+            // recitește input-urile din DOM — esențial pentru căutări ca
+            // "Last 24h", al căror interval nu poate fi reprezentat de
+            // selectoarele <input type="date"> (doar granularitate de zi).
             criteria = this._lastCriteria;
         } else {
             criteria = {
@@ -28,9 +32,20 @@ class SearchManager {
         await this.executeSearch(criteria, loadMore, loadMore ? this._lastDateLabel : null);
     }
 
+    // Comoditate: ultimele 24h, fereastră glisantă (nu aliniată la miezul
+    // nopții) — folosește timestamp-uri precise RFC3339, nu selectoarele de
+    // dată din UI (acelea acceptă doar granularitate de zi).
+    //
+    // Cere dintr-o dată până la maxMessages (5000), nu doar 500 — la volum
+    // mare de trafic pe 24h, un singur "Load More" de 500 lăsa userul cu
+    // impresia (greșită) că a văzut tot. Dacă tot mai există mai multe decât
+    // maxMessages, afișăm un avertisment vizibil (nu doar text discret).
     async searchLast24Hours() {
         const now = new Date();
         const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+        // Golim selectoarele de dată din UI ca să nu sugereze un interval
+        // greșit (o zi anume) dacă userul se uită la ele după aceea.
         const searchDateFrom = document.getElementById('searchDateFrom');
         const searchDateTo = document.getElementById('searchDateTo');
         if (searchDateFrom) searchDateFrom.value = '';
@@ -42,6 +57,7 @@ class SearchManager {
             severity: '',
             dateFrom: yesterday.toISOString(),
             dateTo: now.toISOString(),
+            limit: this.client.pagination.maxMessages,
         };
 
         await this.executeSearch(criteria, false, 'Last 24 hours');
@@ -49,6 +65,7 @@ class SearchManager {
 
     async executeSearch(criteria, loadMore, dateLabel) {
         const { searchTerm, hostname, severity, dateFrom, dateTo } = criteria;
+        const limit = criteria.limit || 500;
 
         this.client.searchMode = true;
         this.client.pagination.isLoading = true;
@@ -69,7 +86,7 @@ class SearchManager {
                 severity: severity || '',
                 date_from: dateFrom || '',
                 date_to: dateTo || '',
-                limit: 500,
+                limit: limit,
                 offset: loadMore ? this.client.pagination.offset : 0
             });
 
@@ -97,6 +114,7 @@ class SearchManager {
                 this.client.updateTimestamps?.();
 
                 this.updateSearchResultsUI(total, dateLabel, dateFrom, dateTo);
+                this.updateSearchLimitWarning(total, dateLabel);
 
                 if (!loadMore) {
                     this.updateSearchBanner(searchTerm, hostname, severity, dateLabel, dateFrom, dateTo);
@@ -128,6 +146,25 @@ class SearchManager {
         const searchResultsEl = document.getElementById('searchResults');
         if (searchResultsEl) {
             searchResultsEl.textContent = resultsText;
+        }
+    }
+
+    // Avertisment vizibil (nu doar text discret) când s-a atins plafonul
+    // maxMessages și tot mai există mesaje neafișate — asta e diferit de
+    // cazul normal "click Load More pentru mai multe", unde userul poate
+    // acționa; aici a atins limita absolută afișabilă în UI.
+    updateSearchLimitWarning(total) {
+        const warningEl = document.getElementById('searchLimitWarning');
+        if (!warningEl) return;
+
+        const shown = this.client.messages.length;
+        const ceiling = this.client.pagination.maxMessages;
+
+        if (shown >= ceiling && total > ceiling) {
+            warningEl.textContent = `⚠ Showing the most recent ${shown} of ${total} matching messages — display limit is ${ceiling}. Narrow the date range or filters to see the rest.`;
+            warningEl.classList.remove('hidden');
+        } else {
+            warningEl.classList.add('hidden');
         }
     }
 
@@ -173,6 +210,9 @@ class SearchManager {
 
         const searchModeBanner = document.getElementById('searchModeBanner');
         if (searchModeBanner) searchModeBanner.classList.add('hidden');
+
+        const searchLimitWarning = document.getElementById('searchLimitWarning');
+        if (searchLimitWarning) searchLimitWarning.classList.add('hidden');
 
         this.client.clearMessages();
         this.client.loadMoreMessages();
