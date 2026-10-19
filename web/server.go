@@ -1,9 +1,11 @@
 package web
 
 import (
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
-	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -11,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"syslog-server/storage"
@@ -27,10 +30,24 @@ var staticFiles embed.FS
 
 const embeddedStaticRoot = "static"
 
+// maxAPILimit e plafonul de mesaje returnate de un singur request. Trebuie să
+// rămână aliniat cu pagination.maxMessages din frontend (5000).
+const maxAPILimit = 5000
+
 type Server struct {
 	wsHub   *websocket.Hub
 	storage storage.Storage
 	handler interface{} // Pentru a accesa GetStats() dacă există
+
+	authUser   string
+	authPass   string
+	corsOrigin string
+
+	routesOnce sync.Once
+	mux        *http.ServeMux
+
+	httpMu     sync.Mutex
+	httpServer *http.Server
 }
 
 func NewServer(wsHub *websocket.Hub, storage storage.Storage) *Server {
@@ -46,21 +63,114 @@ func (s *Server) SetHandler(handler interface{}) {
 	s.handler = handler
 }
 
-// SetupRoutes configurează rutele HTTP
-func (s *Server) SetupRoutes() {
-	http.Handle("/", s.buildStaticHandler())
-	http.HandleFunc("/ws", s.wsHub.ServeWebSocket)
-	http.HandleFunc("/api/messages", s.handleGetMessages)
-	http.HandleFunc("/api/messages/paginated", s.handleGetMessagesPaginated)
-	http.HandleFunc("/api/messages/count", s.handleGetMessageCount)
-	http.HandleFunc("/api/messages/search", s.handleSearchMessages)
-	http.HandleFunc("/api/history", s.handleGetHistory)
-	http.HandleFunc("/api/stats", s.handleGetStats)
+// SetBasicAuth activează autentificarea HTTP Basic pentru UI, API și /ws.
+// Un user gol o dezactivează.
+func (s *Server) SetBasicAuth(user, password string) {
+	s.authUser = user
+	s.authPass = password
 }
 
-func (s *Server) Start(addr string) error {
+// SetCORSOrigin permite explicit un origin extern. Implicit nu se trimite
+// niciun header CORS (UI-ul e servit de același server), în loc de
+// "Access-Control-Allow-Origin: *" care lăsa orice site să citească logurile.
+func (s *Server) SetCORSOrigin(origin string) {
+	s.corsOrigin = origin
+}
+
+func (s *Server) setAPIHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.corsOrigin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", s.corsOrigin)
+	}
+}
+
+// jsonError scrie o eroare JSON cu Content-Type corect (http.Error îl forța pe
+// text/plain deși corpul era JSON).
+func jsonError(w http.ResponseWriter, message string, status int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	body, _ := json.Marshal(map[string]string{"error": message})
+	w.Write(body)
+}
+
+// SetupRoutes configurează rutele HTTP (pe un mux propriu, nu pe
+// DefaultServeMux; apelabilă de mai multe ori fără panică).
+func (s *Server) SetupRoutes() {
+	s.routesOnce.Do(func() {
+		mux := http.NewServeMux()
+		mux.Handle("/", s.buildStaticHandler())
+		mux.HandleFunc("/ws", s.wsHub.ServeWebSocket)
+		mux.HandleFunc("/api/messages", s.handleGetMessages)
+		mux.HandleFunc("/api/messages/paginated", s.handleGetMessagesPaginated)
+		mux.HandleFunc("/api/messages/count", s.handleGetMessageCount)
+		mux.HandleFunc("/api/messages/search", s.handleSearchMessages)
+		mux.HandleFunc("/api/history", s.handleGetHistory)
+		mux.HandleFunc("/api/stats", s.handleGetStats)
+		s.mux = mux
+	})
+}
+
+// Handler întoarce handler-ul HTTP complet (rute + autentificare).
+func (s *Server) Handler() http.Handler {
 	s.SetupRoutes()
-	return http.ListenAndServe(addr, nil)
+	return s.withAuth(s.mux)
+}
+
+// withAuth cere HTTP Basic auth dacă a fost configurată.
+func (s *Server) withAuth(next http.Handler) http.Handler {
+	if s.authUser == "" {
+		return next
+	}
+
+	// Se compară hash-uri, ca lungimea credențialelor să nu se scurgă prin timing.
+	wantUser := sha256.Sum256([]byte(s.authUser))
+	wantPass := sha256.Sum256([]byte(s.authPass))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		gotUser := sha256.Sum256([]byte(user))
+		gotPass := sha256.Sum256([]byte(pass))
+
+		userOK := subtle.ConstantTimeCompare(gotUser[:], wantUser[:]) == 1
+		passOK := subtle.ConstantTimeCompare(gotPass[:], wantPass[:]) == 1
+
+		if !ok || !userOK || !passOK {
+			w.Header().Set("WWW-Authenticate", `Basic realm="syslog-server"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Start pornește serverul HTTP (blochează). Întoarce http.ErrServerClosed după Shutdown.
+func (s *Server) Start(addr string) error {
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second, // fără timeouts: Slowloris ținea conexiunile deschise la nesfârșit
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	s.httpMu.Lock()
+	s.httpServer = srv
+	s.httpMu.Unlock()
+
+	return srv.ListenAndServe()
+}
+
+// Shutdown oprește grațios serverul HTTP pornit cu Start.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.httpMu.Lock()
+	srv := s.httpServer
+	s.httpMu.Unlock()
+
+	if srv == nil {
+		return nil
+	}
+	return srv.Shutdown(ctx)
 }
 
 // buildStaticHandler alege sursa fișierelor UI:
@@ -89,8 +199,7 @@ func (s *Server) buildStaticHandler() http.Handler {
 
 // handleGetMessages returnează mesaje recente
 func (s *Server) handleGetMessages(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	s.setAPIHeaders(w)
 
 	// Obține parametrul limit din query string
 	limitStr := r.URL.Query().Get("limit")
@@ -100,32 +209,34 @@ func (s *Server) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 			limit = l
 		}
 	}
+	if limit > maxAPILimit {
+		limit = maxAPILimit // fără plafon, ?limit=1000000 citea tot istoricul în memorie
+	}
 
 	// Verifică dacă storage-ul suportă citirea
 	if reader, ok := s.storage.(storage.Reader); ok {
 		messages, err := reader.GetRecentMessages(limit)
 		if err != nil {
-			http.Error(w, `{"error": "Failed to read messages"}`, http.StatusInternalServerError)
+			jsonError(w, "Failed to read messages", http.StatusInternalServerError)
 			return
 		}
 
 		// Convert messages to JSON
 		jsonData, err := json.Marshal(messages)
 		if err != nil {
-			http.Error(w, `{"error": "Failed to encode messages"}`, http.StatusInternalServerError)
+			jsonError(w, "Failed to encode messages", http.StatusInternalServerError)
 			return
 		}
 
 		w.Write(jsonData)
 	} else {
-		http.Error(w, `{"error": "Storage does not support reading"}`, http.StatusNotImplemented)
+		jsonError(w, "Storage does not support reading", http.StatusNotImplemented)
 	}
 }
 
 // handleGetStats returnează statistici despre server
 func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	s.setAPIHeaders(w)
 
 	stats := make(map[string]interface{})
 
@@ -138,6 +249,10 @@ func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	// Statistici despre conexiunile websocket
+	stats["websocket_clients"] = s.wsHub.ClientCount()
+	stats["websocket_broadcast_dropped"] = s.wsHub.Dropped()
 
 	// Adaugă statistici despre storage
 	if reader, ok := s.storage.(storage.Reader); ok {
@@ -183,8 +298,7 @@ func parseFlexibleTime(raw string, endOfDayIfDateOnly bool) time.Time {
 
 // handleSearchMessages - server-side search în toate mesajele
 func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	s.setAPIHeaders(w)
 
 	// Parse parametri
 	searchTerm := r.URL.Query().Get("q")
@@ -199,8 +313,8 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = 100
 	}
-	if limit > 500 {
-		limit = 500
+	if limit > maxAPILimit {
+		limit = maxAPILimit
 	}
 	if offset < 0 {
 		offset = 0
@@ -247,14 +361,15 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 	searcher, ok := s.storage.(Searcher)
 	if !ok {
 		log.Printf("Storage type assertion failed. Storage type: %T", s.storage)
-		http.Error(w, `{"error": "Storage does not support search"}`, http.StatusNotImplemented)
+		jsonError(w, "Storage does not support search", http.StatusNotImplemented)
 		return
 	}
 
 	messages, total, err := searcher.SearchMessages(searchTerm, hostname, severity, severityMax, dateFromParsed, dateToParsed, limit, offset)
 	if err != nil {
 		log.Printf("Search error: %v", err)
-		http.Error(w, fmt.Sprintf(`{"error": "Search failed: %v"}`, err), http.StatusInternalServerError)
+		log.Printf("Search failed: %v", err)
+		jsonError(w, "Search failed", http.StatusInternalServerError)
 		return
 	}
 
@@ -276,7 +391,7 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 
 	jsonData, err := json.Marshal(response)
 	if err != nil {
-		http.Error(w, `{"error": "Failed to encode response"}`, http.StatusInternalServerError)
+		jsonError(w, "Failed to encode response", http.StatusInternalServerError)
 		return
 	}
 
@@ -285,8 +400,7 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 
 // handleGetMessagesPaginated - nou endpoint pentru paginare
 func (s *Server) handleGetMessagesPaginated(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	s.setAPIHeaders(w)
 
 	// Obține parametrii de paginare
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
@@ -306,7 +420,7 @@ func (s *Server) handleGetMessagesPaginated(w http.ResponseWriter, r *http.Reque
 	if reader, ok := s.storage.(storage.Reader); ok {
 		messages, total, err := reader.GetMessagesPaginated(offset, limit)
 		if err != nil {
-			http.Error(w, `{"error": "Failed to read messages"}`, http.StatusInternalServerError)
+			jsonError(w, "Failed to read messages", http.StatusInternalServerError)
 			return
 		}
 
@@ -321,25 +435,24 @@ func (s *Server) handleGetMessagesPaginated(w http.ResponseWriter, r *http.Reque
 
 		jsonData, err := json.Marshal(response)
 		if err != nil {
-			http.Error(w, `{"error": "Failed to encode messages"}`, http.StatusInternalServerError)
+			jsonError(w, "Failed to encode messages", http.StatusInternalServerError)
 			return
 		}
 
 		w.Write(jsonData)
 	} else {
-		http.Error(w, `{"error": "Storage does not support reading"}`, http.StatusNotImplemented)
+		jsonError(w, "Storage does not support reading", http.StatusNotImplemented)
 	}
 }
 
 // handleGetMessageCount - endpoint pentru numărul total
 func (s *Server) handleGetMessageCount(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	s.setAPIHeaders(w)
 
 	if reader, ok := s.storage.(storage.Reader); ok {
 		count, err := reader.GetTotalMessageCount()
 		if err != nil {
-			http.Error(w, `{"error": "Failed to get count"}`, http.StatusInternalServerError)
+			jsonError(w, "Failed to get count", http.StatusInternalServerError)
 			return
 		}
 
@@ -347,14 +460,13 @@ func (s *Server) handleGetMessageCount(w http.ResponseWriter, r *http.Request) {
 		jsonData, _ := json.Marshal(response)
 		w.Write(jsonData)
 	} else {
-		http.Error(w, `{"error": "Storage does not support counting"}`, http.StatusNotImplemented)
+		jsonError(w, "Storage does not support counting", http.StatusNotImplemented)
 	}
 }
 
 // handleGetHistory returnează mesaje pentru o dată specificată
 func (s *Server) handleGetHistory(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	s.setAPIHeaders(w)
 
 	dateStr := r.URL.Query().Get("date")
 	if dateStr == "" {
@@ -363,25 +475,25 @@ func (s *Server) handleGetHistory(w http.ResponseWriter, r *http.Request) {
 
 	date, err := time.Parse("2006-01-02", dateStr)
 	if err != nil {
-		http.Error(w, `{"error": "Invalid date format"}`, http.StatusBadRequest)
+		jsonError(w, "Invalid date format", http.StatusBadRequest)
 		return
 	}
 
 	if reader, ok := s.storage.(storage.Reader); ok {
 		messages, err := reader.GetMessagesByDate(date)
 		if err != nil {
-			http.Error(w, `{"error": "Failed to read messages for date"}`, http.StatusInternalServerError)
+			jsonError(w, "Failed to read messages for date", http.StatusInternalServerError)
 			return
 		}
 
 		jsonData, err := json.Marshal(messages)
 		if err != nil {
-			http.Error(w, `{"error": "Failed to encode messages"}`, http.StatusInternalServerError)
+			jsonError(w, "Failed to encode messages", http.StatusInternalServerError)
 			return
 		}
 
 		w.Write(jsonData)
 	} else {
-		http.Error(w, `{"error": "Storage does not support reading"}`, http.StatusNotImplemented)
+		jsonError(w, "Storage does not support reading", http.StatusNotImplemented)
 	}
 }

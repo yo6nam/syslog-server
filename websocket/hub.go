@@ -3,15 +3,40 @@ package websocket
 import (
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+const (
+	writeWait      = 10 * time.Second
+	pongWait       = 60 * time.Second
+	pingPeriod     = 30 * time.Second
+	maxMessageSize = 4096
+)
+
+// checkSameOrigin acceptă doar conexiuni inițiate de pagina servită de acest
+// server (Origin == Host) sau de clienți fără Origin (unelte, nu browsere).
+// Cu "return true" orice site deschis în browser se putea conecta la /ws și
+// citi logurile (cross-site WebSocket hijacking).
+func checkSameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins in development
-	},
+	CheckOrigin: checkSameOrigin,
 }
 
 type Client struct {
@@ -26,6 +51,9 @@ type Hub struct {
 	register   chan *Client
 	unregister chan *Client
 	mutex      sync.RWMutex
+
+	dropped     uint64 // mesaje pierdute pentru că canalul de broadcast era plin
+	lastDropLog int64  // unix nano al ultimei linii de log despre drop-uri
 }
 
 func NewHub() *Hub {
@@ -37,23 +65,37 @@ func NewHub() *Hub {
 	}
 }
 
+// ClientCount întoarce numărul de clienți conectați.
+func (h *Hub) ClientCount() int {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+	return len(h.clients)
+}
+
+// Dropped întoarce câte mesaje nu au putut fi puse în coada de broadcast.
+func (h *Hub) Dropped() uint64 {
+	return atomic.LoadUint64(&h.dropped)
+}
+
 func (h *Hub) Run() {
 	for {
 		select {
 		case client := <-h.register:
 			h.mutex.Lock()
 			h.clients[client] = true
+			total := len(h.clients)
 			h.mutex.Unlock()
-			log.Printf("Client connected. Total clients: %d", len(h.clients))
+			log.Printf("Client connected. Total clients: %d", total)
 
 		case client := <-h.unregister:
-			h.mutex.RLock()
+			h.mutex.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.send)
 			}
-			h.mutex.RUnlock()
-			log.Printf("Client disconnected. Total clients: %d", len(h.clients))
+			total := len(h.clients)
+			h.mutex.Unlock()
+			log.Printf("Client disconnected. Total clients: %d", total)
 
 		case message := <-h.broadcast:
 			h.mutex.Lock()
@@ -76,7 +118,14 @@ func (h *Hub) Broadcast(message []byte) {
 	select {
 	case h.broadcast <- message:
 	default:
-		log.Printf("Warning: Broadcast channel full, message dropped")
+		total := atomic.AddUint64(&h.dropped, 1)
+
+		// O singură linie la cel mult 10s, nu una per mesaj pierdut.
+		now := time.Now().UnixNano()
+		last := atomic.LoadInt64(&h.lastDropLog)
+		if now-last > int64(10*time.Second) && atomic.CompareAndSwapInt64(&h.lastDropLog, last, now) {
+			log.Printf("Warning: Broadcast channel full, %d messages dropped so far", total)
+		}
 	}
 }
 
@@ -106,6 +155,14 @@ func (c *Client) readPump() {
 		c.conn.Close()
 	}()
 
+	// Ping/pong: fără ele, un client dispărut fără FIN (Wi-Fi căzut, laptop
+	// închis) rămânea conectat până îi se umplea bufferul.
+	c.conn.SetReadLimit(maxMessageSize)
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
 	for {
 		_, _, err := c.conn.ReadMessage()
 		if err != nil {
@@ -118,11 +175,16 @@ func (c *Client) readPump() {
 }
 
 func (c *Client) writePump() {
-	defer c.conn.Close()
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
 
 	for {
 		select {
 		case message, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
 				// Hub closed the channel
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
@@ -131,6 +193,12 @@ func (c *Client) writePump() {
 
 			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				log.Printf("WebSocket write error: %v", err)
+				return
+			}
+
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
 		}

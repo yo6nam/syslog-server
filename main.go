@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -9,17 +10,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
 	"syslog-server/alerting"
-	"syslog-server/syslog"
 	"syslog-server/storage"
+	"syslog-server/syslog"
 	"syslog-server/types"
 	"syslog-server/version"
-	"syslog-server/websocket"
 	"syslog-server/web"
+	"syslog-server/websocket"
 )
 
 func main() {
@@ -42,6 +42,9 @@ func main() {
 		log.Printf("No config file found at %s — created one with default values. Edit it and restart to customize.", *configPath)
 	} else {
 		log.Printf("Loaded configuration from: %s", *configPath)
+	}
+	for _, warning := range config.Validate() {
+		log.Printf("⚠️  Config: %s", warning)
 	}
 	log.Printf("Log directory: %s", config.Storage.LogDirectory)
 	log.Printf("MySQL enabled: %v", config.MySQL.Enabled)
@@ -104,6 +107,20 @@ func main() {
 		config.RateLimiter.MessagesPerSecond,
 		config.RateLimiter.BurstSize,
 	)
+	syslogHandler.SetLogEveryMessage(config.Syslog.LogEveryMessage)
+
+	if config.Dedup.Enabled {
+		syslogHandler.EnableDedup(syslog.DedupConfig{
+			Window:            time.Duration(config.Dedup.WindowSeconds) * time.Second,
+			MaxInterval:       time.Duration(config.Dedup.MaxIntervalSeconds) * time.Second,
+			MaxEntries:        config.Dedup.MaxEntries,
+			NormalizePatterns: config.Dedup.NormalizePatterns,
+		})
+		log.Printf("♻️  Duplicate suppression enabled: summary after %ds quiet, at least every %ds during a flood",
+			config.Dedup.WindowSeconds, config.Dedup.MaxIntervalSeconds)
+	} else {
+		log.Println("Duplicate suppression disabled in configuration")
+	}
 
 	// Log ban list info
 	if len(config.BanList.IPs) > 0 {
@@ -128,58 +145,46 @@ func main() {
 		}
 	}
 
-	// Start Web server
+	// Web server
 	webServer := web.NewServer(wsHub, storageBackend)
 	webServer.SetHandler(syslogHandler)
+	webServer.SetBasicAuth(config.Web.BasicAuthUser, config.Web.BasicAuthPassword)
+	webServer.SetCORSOrigin(config.Web.CORSAllowOrigin)
 
-	syslogServer := syslog.NewServer(syslogHandler)
+	if config.Web.BasicAuthUser != "" {
+		log.Println("🔒 Web interface protected with HTTP Basic authentication")
+	} else if !isLoopbackAddr(config.Ports.Web) {
+		log.Printf("⚠️  Web interface on %s has no authentication (set web.basic_auth_user / web.basic_auth_password)", config.Ports.Web)
+	}
+
+	syslogServer := syslog.NewServerWithConfig(syslogHandler, syslog.ServerConfig{
+		UDPReadBufferBytes: config.Syslog.UDPReadBufferBytes,
+		UDPQueueSize:       config.Syslog.UDPQueueSize,
+		MaxTCPConnections:  config.Syslog.MaxTCPConnections,
+	})
 
 	// Context pentru shutdown
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	defer shutdownCancel()
 
-	var wg sync.WaitGroup
-
-	// Start TCP listener cu shutdown
-	var tcpListener net.Listener
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		var err error
-		tcpListener, err = syslogServer.StartTCPWithContext(shutdownCtx, config.Ports.SyslogTCP)
-		if err != nil {
-			log.Printf("TCP listener error: %v", err)
-		}
-	}()
-
-	// Start UDP listener cu shutdown
-	var udpConn *net.UDPConn
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		var err error
-		udpConn, err = syslogServer.StartUDPWithContext(shutdownCtx, config.Ports.SyslogUDP)
-		if err != nil {
-			log.Printf("UDP listener error: %v", err)
-		}
-	}()
-
-	httpServer := &http.Server{
-		Addr:    config.Ports.Web,
-		Handler: http.DefaultServeMux,
+	// Listenerii se deschid sincron: erorile de bind sunt fatale la pornire, iar
+	// "ready" nu mai apare înaintea socket-urilor (și dispar data race-urile pe
+	// variabilele listenerilor).
+	if _, err := syslogServer.StartTCPWithContext(shutdownCtx, config.Ports.SyslogTCP); err != nil {
+		log.Fatalf("TCP listener error: %v", err)
+	}
+	if _, err := syslogServer.StartUDPWithContext(shutdownCtx, config.Ports.SyslogUDP); err != nil {
+		log.Fatalf("UDP listener error: %v", err)
 	}
 
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		log.Printf("Web interface available on %s", config.Ports.Web)
-
-		if err := webServer.Start(config.Ports.Web); err != nil && err != http.ErrServerClosed {
+		if err := webServer.Start(config.Ports.Web); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("Web server error: %v", err)
 		}
 	}()
 
-	log.Printf("Syslog server listening on %s (TCP/UDP)", config.Ports.SyslogTCP)
+	log.Printf("Syslog server listening on TCP %s, UDP %s", config.Ports.SyslogTCP, config.Ports.SyslogUDP)
 	log.Println("Server is ready and accepting connections!")
 
 	// Ascultă pentru semnale de închidere
@@ -192,44 +197,28 @@ func main() {
 	// ✅ Stop retention manager
 	retentionManager.Stop()
 
-	// 1. Cancelează context-ul pentru a opri acceptarea de conexiuni noi
+	// 1. Oprește listenerii (închide socket-urile și conexiunile TCP active)
 	shutdownCancel()
-
-	// 2. Închide listenerii pentru a opri imediat acceptarea conexiunilor
-	if tcpListener != nil {
-		tcpListener.Close()
-		log.Println("TCP listener closed")
-	}
-	if udpConn != nil {
-		udpConn.Close()
-		log.Println("UDP listener closed")
+	if syslogServer.Wait(5 * time.Second) {
+		log.Println("All listeners stopped")
+	} else {
+		log.Println("Listener shutdown timeout, continuing...")
 	}
 
-	// 3. Oprește web server-ul
+	// 2. Golește starea în așteptare (rezumatele dedup) cât storage-ul e încă deschis
+	syslogHandler.Close()
+
+	// 3. Oprește web server-ul (de data asta chiar cel care rulează)
 	webShutdownCtx, webCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer webCancel()
 
-	if err := httpServer.Shutdown(webShutdownCtx); err != nil {
+	if err := webServer.Shutdown(webShutdownCtx); err != nil {
 		log.Printf("Web server shutdown error: %v", err)
 	} else {
 		log.Println("Web server closed")
 	}
 
-	// 4. Așteaptă ca goroutine-urile să se termine (dar nu prea mult)
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		log.Println("All listeners stopped")
-	case <-time.After(3 * time.Second):
-		log.Println("Listener shutdown timeout, continuing...")
-	}
-
-	// 5. ACUM închide storage-ul (după ce nu mai primim mesaje)
+	// 4. ACUM închide storage-ul (după ce nu mai primim mesaje)
 	log.Println("Closing storage connections...")
 	if multiStorage, ok := storageBackend.(*storage.MultiStorage); ok {
 		if err := multiStorage.Close(); err != nil {
@@ -246,6 +235,20 @@ func main() {
 	}
 
 	log.Println("Server shutdown complete")
+}
+
+// isLoopbackAddr spune dacă adresa de ascultare e doar locală ("127.0.0.1:8080",
+// "localhost:8080"); ":8080" înseamnă toate interfețele.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func getEnv(key, defaultValue string) string {

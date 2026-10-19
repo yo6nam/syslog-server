@@ -10,13 +10,13 @@ import (
 	"sync"
 	"time"
 
-	"syslog-server/types"
 	_ "github.com/go-sql-driver/mysql"
+	"syslog-server/types"
 )
 
 type MySQLStorage struct {
-	db          *sql.DB
-	countCache  *CountCache
+	db         *sql.DB
+	countCache *CountCache
 }
 
 // CountCache pentru a evita COUNT(*) la fiecare request
@@ -393,57 +393,57 @@ func (ms *MySQLStorage) GetTotalMessageCount() (int, error) {
 
 // SearchMessages caută în toate mesajele (server-side search)
 func (ms *MySQLStorage) SearchMessages(searchTerm string, hostname string, severity int, severityMax int, dateFrom time.Time, dateTo time.Time, limit int, offset int) ([]*types.SyslogMessage, int, error) {
-    ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-    defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 
-    // Build query CU PLACEHOLDERS, NU cu concatenare
-    whereConditions := []string{}
-    args := []interface{}{}
+	// Build query CU PLACEHOLDERS, NU cu concatenare
+	whereConditions := []string{}
+	args := []interface{}{}
 
-    if searchTerm != "" {
-        whereConditions = append(whereConditions, "(content LIKE ? OR raw_message LIKE ?)")
-        searchPattern := "%" + searchTerm + "%"
-        args = append(args, searchPattern, searchPattern)
-    }
+	if searchTerm != "" {
+		whereConditions = append(whereConditions, "(content LIKE ? OR raw_message LIKE ?)")
+		searchPattern := "%" + searchTerm + "%"
+		args = append(args, searchPattern, searchPattern)
+	}
 
-    if hostname != "" {
-        whereConditions = append(whereConditions, "hostname LIKE ?")
-        args = append(args, "%"+hostname+"%")
-    }
+	if hostname != "" {
+		whereConditions = append(whereConditions, "hostname LIKE ?")
+		args = append(args, "%"+hostname+"%")
+	}
 
-    if severity >= 0 && severityMax >= 0 {
-        whereConditions = append(whereConditions, "severity BETWEEN ? AND ?")
-        args = append(args, severity, severityMax)
-    } else if severity >= 0 && severity <= 7 {
-        whereConditions = append(whereConditions, "severity = ?")
-        args = append(args, severity)
-    }
+	if severity >= 0 && severityMax >= 0 {
+		whereConditions = append(whereConditions, "severity BETWEEN ? AND ?")
+		args = append(args, severity, severityMax)
+	} else if severity >= 0 && severity <= 7 {
+		whereConditions = append(whereConditions, "severity = ?")
+		args = append(args, severity)
+	}
 
-    if !dateFrom.IsZero() && !dateTo.IsZero() {
-        whereConditions = append(whereConditions, "timestamp BETWEEN ? AND ?")
-        args = append(args, dateFrom, dateTo)
-    } else if !dateFrom.IsZero() {
-        whereConditions = append(whereConditions, "timestamp >= ?")
-        args = append(args, dateFrom)
-    } else if !dateTo.IsZero() {
-        whereConditions = append(whereConditions, "timestamp <= ?")
-        args = append(args, dateTo)
-    }
+	if !dateFrom.IsZero() && !dateTo.IsZero() {
+		whereConditions = append(whereConditions, "timestamp BETWEEN ? AND ?")
+		args = append(args, dateFrom, dateTo)
+	} else if !dateFrom.IsZero() {
+		whereConditions = append(whereConditions, "timestamp >= ?")
+		args = append(args, dateFrom)
+	} else if !dateTo.IsZero() {
+		whereConditions = append(whereConditions, "timestamp <= ?")
+		args = append(args, dateTo)
+	}
 
-    whereClause := ""
-    if len(whereConditions) > 0 {
-        whereClause = "WHERE " + strings.Join(whereConditions, " AND ")
-    }
+	whereClause := ""
+	if len(whereConditions) > 0 {
+		whereClause = "WHERE " + strings.Join(whereConditions, " AND ")
+	}
 
-    // COUNT query - SAFE acum
-    countQuery := "SELECT COUNT(*) FROM syslog_messages " + whereClause
-    var totalCount int
-    if err := ms.db.QueryRowContext(ctx, countQuery, args...).Scan(&totalCount); err != nil {
-        return nil, 0, fmt.Errorf("failed to count search results: %v", err)
-    }
+	// COUNT query - SAFE acum
+	countQuery := "SELECT COUNT(*) FROM syslog_messages " + whereClause
+	var totalCount int
+	if err := ms.db.QueryRowContext(ctx, countQuery, args...).Scan(&totalCount); err != nil {
+		return nil, 0, fmt.Errorf("failed to count search results: %v", err)
+	}
 
-    // Main query - SAFE acum
-    query := fmt.Sprintf(`
+	// Main query - SAFE acum
+	query := fmt.Sprintf(`
         SELECT id, timestamp, hostname, tag, content, severity, facility, priority, remote_ip, protocol, raw_message, created_at
         FROM syslog_messages
         %s
@@ -451,41 +451,41 @@ func (ms *MySQLStorage) SearchMessages(searchTerm string, hostname string, sever
         LIMIT ? OFFSET ?
     `, whereClause)
 
-    if offset < 0 {
-        offset = 0
-    }
-    if limit <= 0 {
-        limit = 100
-    }
-    if limit > 5000 {
-        limit = 5000
-    }
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 5000 {
+		limit = 5000
+	}
 
-    // Adaugă limit/offset la args
-    args = append(args, limit, offset)
+	// Adaugă limit/offset la args
+	args = append(args, limit, offset)
 
-    rows, err := ms.db.QueryContext(ctx, query, args...)
-    if err != nil {
-        return nil, 0, fmt.Errorf("failed to search messages: %v", err)
-    }
-    defer rows.Close()
+	rows, err := ms.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to search messages: %v", err)
+	}
+	defer rows.Close()
 
-    // Rest of the code remains the same...
-    var messages []*types.SyslogMessage
-    for rows.Next() {
-        var msg types.SyslogMessage
-        err := rows.Scan(
-            &msg.ID, &msg.Timestamp, &msg.Hostname, &msg.Tag,
-            &msg.Content, &msg.Severity, &msg.Facility, &msg.Priority,
-            &msg.RemoteIP, &msg.Protocol, &msg.RawMessage, &msg.CreatedAt,
-        )
-        if err != nil {
-            return nil, 0, fmt.Errorf("failed to scan message: %v", err)
-        }
-        messages = append(messages, &msg)
-    }
+	// Rest of the code remains the same...
+	var messages []*types.SyslogMessage
+	for rows.Next() {
+		var msg types.SyslogMessage
+		err := rows.Scan(
+			&msg.ID, &msg.Timestamp, &msg.Hostname, &msg.Tag,
+			&msg.Content, &msg.Severity, &msg.Facility, &msg.Priority,
+			&msg.RemoteIP, &msg.Protocol, &msg.RawMessage, &msg.CreatedAt,
+		)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to scan message: %v", err)
+		}
+		messages = append(messages, &msg)
+	}
 
-    return messages, totalCount, nil
+	return messages, totalCount, nil
 }
 
 // DeleteOldMessages șterge mesajele mai vechi decât cutoffDate, în loturi mici

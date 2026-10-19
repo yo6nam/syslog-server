@@ -5,18 +5,18 @@ import (
 )
 
 type SyslogMessage struct {
-    ID         int64     `json:"id"`
-    Timestamp  time.Time `json:"timestamp"`
-    Hostname   string    `json:"hostname"`
-    Tag        string    `json:"tag"`
-    Content    string    `json:"content"`
-    Severity   int       `json:"severity"`
-    Facility   int       `json:"facility"`
-    Priority   int       `json:"priority"`
-    RemoteIP   string    `json:"remote_ip"`
-    Protocol   string    `json:"protocol"`
-    RawMessage string    `json:"raw_message"`
-    CreatedAt  time.Time `json:"created_at"`
+	ID         int64     `json:"id"`
+	Timestamp  time.Time `json:"timestamp"`
+	Hostname   string    `json:"hostname"`
+	Tag        string    `json:"tag"`
+	Content    string    `json:"content"`
+	Severity   int       `json:"severity"`
+	Facility   int       `json:"facility"`
+	Priority   int       `json:"priority"`
+	RemoteIP   string    `json:"remote_ip"`
+	Protocol   string    `json:"protocol"`
+	RawMessage string    `json:"raw_message"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 func (m *SyslogMessage) SeverityString() string {

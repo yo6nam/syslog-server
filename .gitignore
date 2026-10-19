@@ -1,0 +1,12 @@
+# Configurație locală (poate conține parola MySQL, URL-ul webhook-ului, credențialele UI).
+# Pornește de la config.example.json.
+config.json
+
+# Date generate la rulare
+logs/
+
+# Binare locale
+syslog-server
+syslog-server.exe
+syslog-server-*
+dist/

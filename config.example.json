@@ -1,0 +1,62 @@
+{
+  "mysql": {
+    "enabled": false,
+    "host": "localhost",
+    "port": "3306",
+    "user": "syslog",
+    "password": "",
+    "database": "syslog"
+  },
+  "storage": {
+    "log_directory": "./logs"
+  },
+  "ports": {
+    "syslog_tcp": "0.0.0.0:514",
+    "syslog_udp": "0.0.0.0:514",
+    "web": ":8080"
+  },
+  "rate_limiter": {
+    "messages_per_second": 100,
+    "burst_size": 200
+  },
+  "alerting": {
+    "enabled": false,
+    "webhook_url": "",
+    "severities": [
+      "emergency",
+      "critical"
+    ],
+    "rate_limit_minutes": 60,
+    "timeout_seconds": 10
+  },
+  "retention": {
+    "enabled": false,
+    "days": 90,
+    "run_at": "02:00"
+  },
+  "ban_list": {
+    "ips": [],
+    "hostnames": []
+  },
+  "filters": {
+    "exclude_patterns": []
+  },
+  "dedup": {
+    "enabled": true,
+    "window_seconds": 10,
+    "max_interval_seconds": 60,
+    "max_entries": 10000,
+    "normalize_patterns": []
+  },
+  "web": {
+    "basic_auth_user": "",
+    "basic_auth_password": "",
+    "cors_allow_origin": ""
+  },
+  "syslog": {
+    "udp_read_buffer_bytes": 4194304,
+    "udp_queue_size": 8192,
+    "max_tcp_connections": 1000,
+    "log_every_message": false
+  }
+}

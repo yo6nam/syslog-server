@@ -14,6 +14,9 @@ import (
 var bsdPattern = regexp.MustCompile(`^<(\d+)>(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(\S+)?:?\s*(.*)$`)
 
 // RFC 5424 pattern (structured data)
+// simplePattern e compilat o singură dată (înainte: la fiecare mesaj nepotrivit).
+var simplePattern = regexp.MustCompile(`^<(\d+)>(\S+)\s+(\S+)?:?\s*(.*)$`)
+
 var rfc5424Pattern = regexp.MustCompile(`^<(\d+)>(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S*)\s+(.*)$`)
 
 func ParseMessage(message string, remoteIP string) (*types.SyslogMessage, error) {
@@ -45,8 +48,8 @@ func ParseMessage(message string, remoteIP string) (*types.SyslogMessage, error)
 		Content:    message,
 		RemoteIP:   remoteIP,
 		RawMessage: message,
-		Severity:   6, // info
-		Facility:   1, // user
+		Severity:   6,  // info
+		Facility:   1,  // user
 		Priority:   14, // user.info
 	}, nil
 }
@@ -162,7 +165,6 @@ func parseBSDTimestamp(timestamp string) time.Time {
 }
 
 func parseSimpleFormat(message string, remoteIP string) *types.SyslogMessage {
-	simplePattern := regexp.MustCompile(`^<(\d+)>(\S+)\s+(\S+)?:?\s*(.*)$`)
 
 	matches := simplePattern.FindStringSubmatch(message)
 	if matches == nil {

@@ -52,6 +52,29 @@ type Config struct {
 	Filters struct {
 		ExcludePatterns []string `json:"exclude_patterns"`
 	} `json:"filters"`
+
+	// Dedup suprimă mesajele repetitive identice (după normalizare) și emite
+	// un singur rând rezumat ("... (repeated N times in Xs)").
+	Dedup struct {
+		Enabled            bool     `json:"enabled"`
+		WindowSeconds      int      `json:"window_seconds"`       // liniște după care se emite rezumatul
+		MaxIntervalSeconds int      `json:"max_interval_seconds"` // la flood continuu, rezumat cel puțin la atâtea secunde
+		MaxEntries         int      `json:"max_entries"`          // limită de memorie pentru amprentele urmărite
+		NormalizePatterns  []string `json:"normalize_patterns"`   // regex-uri eliminate înainte de comparare (în plus față de timestamp-urile kernel)
+	} `json:"dedup"`
+
+	Web struct {
+		BasicAuthUser     string `json:"basic_auth_user"` // gol = fără autentificare
+		BasicAuthPassword string `json:"basic_auth_password"`
+		CORSAllowOrigin   string `json:"cors_allow_origin"` // gol = fără header CORS (UI-ul e same-origin)
+	} `json:"web"`
+
+	Syslog struct {
+		UDPReadBufferBytes int  `json:"udp_read_buffer_bytes"` // SO_RCVBUF pentru socket-ul UDP
+		UDPQueueSize       int  `json:"udp_queue_size"`        // coada dintre citirea UDP și procesare
+		MaxTCPConnections  int  `json:"max_tcp_connections"`
+		LogEveryMessage    bool `json:"log_every_message"` // o linie de log per mesaj primit (zgomotos la volum mare)
+	} `json:"syslog"`
 }
 
 func LoadConfig(configPath string) (*Config, bool, error) {
@@ -94,6 +117,17 @@ func LoadConfig(configPath string) (*Config, bool, error) {
 	// Default filters
 	config.Filters.ExcludePatterns = []string{}
 
+	config.Dedup.Enabled = true
+	config.Dedup.WindowSeconds = 10
+	config.Dedup.MaxIntervalSeconds = 60
+	config.Dedup.MaxEntries = 10000
+	config.Dedup.NormalizePatterns = []string{}
+
+	config.Syslog.UDPReadBufferBytes = 4 * 1024 * 1024
+	config.Syslog.UDPQueueSize = 8192
+	config.Syslog.MaxTCPConnections = 1000
+	config.Syslog.LogEveryMessage = false
+
 	// Încarcă din fișier dacă există
 	if configPath != "" {
 		file, err := os.Open(configPath)
@@ -127,5 +161,49 @@ func writeDefaultConfig(configPath string, config *Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath, data, 0644)
+	return os.WriteFile(configPath, data, 0600)
+}
+
+// Validate corectează valorile imposibile/periculoase și întoarce avertismente
+// de afișat la pornire (în loc să pornească cu un limiter care blochează tot).
+func (c *Config) Validate() []string {
+	var warnings []string
+	fix := func(cond bool, msg string, apply func()) {
+		if cond {
+			warnings = append(warnings, msg)
+			apply()
+		}
+	}
+
+	fix(c.RateLimiter.MessagesPerSecond < 1, "rate_limiter.messages_per_second < 1, using 100",
+		func() { c.RateLimiter.MessagesPerSecond = 100 })
+	fix(c.RateLimiter.BurstSize < c.RateLimiter.MessagesPerSecond,
+		"rate_limiter.burst_size < messages_per_second, using 2x messages_per_second",
+		func() { c.RateLimiter.BurstSize = c.RateLimiter.MessagesPerSecond * 2 })
+
+	fix(c.Dedup.WindowSeconds < 1, "dedup.window_seconds < 1, using 10",
+		func() { c.Dedup.WindowSeconds = 10 })
+	fix(c.Dedup.MaxIntervalSeconds < c.Dedup.WindowSeconds,
+		"dedup.max_interval_seconds < window_seconds, using max(60, window_seconds)",
+		func() {
+			c.Dedup.MaxIntervalSeconds = 60
+			if c.Dedup.WindowSeconds > 60 {
+				c.Dedup.MaxIntervalSeconds = c.Dedup.WindowSeconds
+			}
+		})
+	fix(c.Dedup.MaxEntries < 1, "dedup.max_entries < 1, using 10000",
+		func() { c.Dedup.MaxEntries = 10000 })
+
+	fix(c.Syslog.UDPQueueSize < 1, "syslog.udp_queue_size < 1, using 8192",
+		func() { c.Syslog.UDPQueueSize = 8192 })
+	fix(c.Syslog.MaxTCPConnections < 1, "syslog.max_tcp_connections < 1, using 1000",
+		func() { c.Syslog.MaxTCPConnections = 1000 })
+	fix(c.Syslog.UDPReadBufferBytes < 0, "syslog.udp_read_buffer_bytes < 0, using 4 MiB",
+		func() { c.Syslog.UDPReadBufferBytes = 4 * 1024 * 1024 })
+
+	if c.Web.BasicAuthUser != "" && c.Web.BasicAuthPassword == "" {
+		warnings = append(warnings, "web.basic_auth_user is set but web.basic_auth_password is empty")
+	}
+
+	return warnings
 }

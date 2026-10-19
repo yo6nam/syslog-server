@@ -17,7 +17,9 @@ A modern **Syslog Server** written in Go that receives, stores, filters, and dis
 * [How It Works](#how-it-works)
 * [Architecture](#architecture)
 * [Key Technologies](#key-technologies)
+* [Duplicate Suppression](#duplicate-suppression)
 * [Configuration Example](#configuration-example)
+* [Development](#development)
 * [Use Cases](#use-cases)
 * [Production Ready](#production-ready)
 * [TL;DR](#tldr)
@@ -35,6 +37,7 @@ A modern **Syslog Server** written in Go that receives, stores, and displays sys
 ### 📨 Message Reception
 
 * **TCP & UDP listeners** on port 514 (standard syslog)
+* UDP is read into a large socket buffer and a bounded queue with a single consumer, so a burst does not get dropped silently by the kernel and messages are processed **in arrival order** (drops, if the queue still overflows, are counted in `/api/stats`)
 * Parses both **RFC3164** and **RFC5424** formats
 * Compatible with all syslog-capable devices (Cisco, Linux, BSD, etc.)
 
@@ -68,14 +71,26 @@ A modern **Syslog Server** written in Go that receives, stores, and displays sys
 
 #### Content Filtering
 
-* Exclude patterns using regex-like filters
-* Useful for repetitive noise (e.g., `"missed interrupt"`, `"xradio_wlan"`)
+* Exclude patterns: **case-insensitive substring match** on the message content (not regular expressions)
+* Useful for noise you never want to see (e.g., `"missed interrupt"`)
+* For noise you *do* want to know about but not 100 times, use [Duplicate Suppression](#duplicate-suppression)
+
+#### Duplicate Suppression
+
+* Identical repeating messages are collapsed into one line plus a summary, like rsyslog's "last message repeated N times" ([details](#duplicate-suppression))
+
+#### Web Access Control
+
+* Optional HTTP Basic authentication for the UI, the API and the WebSocket (`web.basic_auth_user` / `web.basic_auth_password`)
+* WebSocket connections are accepted only from the page served by this server (same-origin), so a random website cannot read your logs through your browser
+* No CORS headers unless `web.cors_allow_origin` is set
 
 ### 🚨 Alerting System
 
 * Webhook notifications for critical messages
 * Configurable severities (`emergency`, `critical`)
-* Per-hostname rate limiting (e.g., max 1 alert/hour)
+* Rate limiting per hostname **and severity** (e.g., max 1 alert/hour for each), so a minor `critical` does not hide a later `emergency` from the same host
+* Severity names in the config are case-insensitive
 * Sends JSON payloads (Slack, Discord, custom)
 * Asynchronous: does not block message flow
 
@@ -85,15 +100,17 @@ A modern **Syslog Server** written in Go that receives, stores, and displays sys
 
 ```
 Device (router/firewall)
-    ↓ syslog UDP/TCP :514
+    ↓ syslog UDP/TCP :514          (UDP: socket buffer → queue → single worker)
 Syslog Server
-    ├─→ Rate Limiter
-    ├─→ Ban List Check
-    ├─→ Content Filters
+    ├─→ Ban List (IP)
+    ├─→ Rate Limiter (per IP)
     ├─→ Message Parser (RFC3164 / RFC5424)
+    ├─→ Ban List (hostname)
+    ├─→ Content Filters (exclude patterns)
+    ├─→ Duplicate Suppression  ── repeats counted, summary emitted later
+    ├─→ Alerting (webhooks)
     ├─→ Storage (MySQL + File)
-    ├─→ WebSocket Broadcast (real-time UI)
-    └─→ Alerting (webhooks)
+    └─→ WebSocket Broadcast (real-time UI)
 ```
 
 ---
@@ -120,12 +137,53 @@ Syslog Server
 
 ## Key Technologies
 
-* **Go 1.21+**
+* **Go 1.19+**
 * **MySQL 8.0** (optional)
 * **WebSocket** for real-time updates
 * **RFC3164 / RFC5424** parsing
 * **Gorilla WebSocket**
 * **Context-aware** timeouts and graceful shutdown
+
+---
+
+## Duplicate Suppression
+
+Some sources emit the same line dozens of times per second, for example a kernel driver:
+
+```
+[404590.323487] xradio TXRX-ERR: [RX] IF=0, Receive failure: 4.
+[404590.326062] xradio TXRX-ERR: [RX] IF=0, Receive failure: 4.
+[404590.621651] xradio TXRX-ERR: [RX] IF=0, Receive failure: 4.
+...
+```
+
+This is usually well under the rate limit (which only caps *volume*), yet it fills the live view and the history with one line. With duplicate suppression enabled (the default):
+
+1. Each message gets a fingerprint: source IP, hostname, facility, severity, tag and content, **after removing kernel uptime stamps** such as `[404590.323487]`. Other numbers are kept, so `Receive failure: 4` and `Receive failure: 5` stay separate lines, as do `user 123` and `user 124`.
+2. The **first** occurrence passes immediately (stored, broadcast, alerted).
+3. Identical repeats inside the window are only counted.
+4. One summary line is stored and shown when the flood has been quiet for `window_seconds`, or at least every `max_interval_seconds` while it keeps going:
+
+```
+xradio TXRX-ERR: [RX] IF=0, Receive failure: 4. (repeated 23 times in 3s)
+```
+
+Pending summaries are flushed on shutdown. Summaries are not alerted again. No schema change is involved: the count is part of the message text, so search and export work as usual.
+
+```json
+"dedup": {
+  "enabled": true,
+  "window_seconds": 10,
+  "max_interval_seconds": 60,
+  "max_entries": 10000,
+  "normalize_patterns": ["session \\d+"]
+}
+```
+
+* `normalize_patterns`: extra regular expressions removed before comparing (here: session ids). Invalid patterns are ignored with a warning.
+* `max_entries` bounds memory. When the table is full, new messages are simply not tracked (they pass through; nothing is lost).
+* Statistics (`total_suppressed`, `total_summaries`, `dedup_tracked`) are exposed on `/api/stats`.
+* Set `"enabled": false` to store every message.
 
 ---
 
@@ -147,6 +205,34 @@ Syslog Server
 }
 ```
 
+A complete file with every option and its default is in [`config.example.json`](config.example.json). Copy it to `config.json` (which is git-ignored, since it can hold secrets). If `config.json` is missing at startup, a default one is written (permissions `0600`).
+
+Other options worth knowing:
+
+| Option | Default | Purpose |
+|---|---|---|
+| `syslog.udp_read_buffer_bytes` | 4 MiB | UDP socket buffer (the OS may cap it, see `net.core.rmem_max`) |
+| `syslog.udp_queue_size` | 8192 | packets waiting for processing |
+| `syslog.max_tcp_connections` | 1000 | concurrent TCP clients |
+| `syslog.log_every_message` | false | one log line per received message (noisy at volume) |
+| `web.basic_auth_user` / `web.basic_auth_password` | empty | protect UI, API and WebSocket |
+| `web.cors_allow_origin` | empty | allow one external origin to call the API |
+
+Invalid values (for example a rate limit of 0) are repaired at startup and reported as warnings.
+
+---
+
+## Development
+
+```bash
+gofmt -l .                 # must print nothing (CI enforces it)
+go vet ./...
+go test -race -count=1 ./...
+```
+
+* The web UI is embedded in the binary from `web/static/` with `//go:embed`. If that directive is ever lost (for instance by a tool that strips comments), the binary still compiles but serves 404; `web/server_test.go` fails in that case.
+* Every push runs the tests before building the Linux and Windows binaries.
+
 ---
 
 ## Use Cases
@@ -163,7 +249,10 @@ Syslog Server
 
 * ✔ Per-IP rate limiting
 * ✔ Ban list support
-* ✔ Graceful shutdown (no message loss)
+* ✔ Graceful shutdown (listeners stop first, pending summaries are flushed, then storage closes)
+* ✔ Ordered, buffered UDP ingestion with visible drop counters
+* ✔ Duplicate suppression with summaries
+* ✔ Optional authentication and same-origin WebSocket
 * ✔ Context timeouts for all DB queries
 * ✔ SQL injection protection
 * ✔ Optimized DB connection pooling

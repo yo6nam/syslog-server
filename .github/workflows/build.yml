@@ -16,8 +16,49 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: Test (gofmt, vet, go test -race)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify modules
+        run: |
+          go mod download
+          go mod verify
+          cp go.mod /tmp/go.mod.orig && cp go.sum /tmp/go.sum.orig
+          go mod tidy
+          if ! diff -q go.mod /tmp/go.mod.orig >/dev/null || ! diff -q go.sum /tmp/go.sum.orig >/dev/null; then
+            echo "::warning::go.mod/go.sum are not tidy. Run 'go mod tidy' locally and commit the result."
+          fi
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # Include și garda pentru directiva //go:embed (web/server_test.go): fără
+      # ea binarul compilează dar UI-ul răspunde 404.
+      - name: Test (race detector)
+        run: go test -race -count=1 ./...
+
   build:
     name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -39,22 +80,8 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Tidy modules, verify, vet
-        run: |
-          echo "== go env =="
-          go env GOFLAGS GOPROXY GOSUMDB
-          echo "== go.mod before =="
-          cat go.mod
-          echo "== running go mod tidy =="
-          go mod tidy -v
-          echo "== go.sum after tidy =="
-          ls -la go.sum && cat go.sum
-          go mod verify
-          if ! git diff --quiet -- go.mod go.sum; then
-            echo "::warning::go.mod/go.sum changed after 'go mod tidy'. Run it locally and commit go.sum for reproducible builds."
-            git diff -- go.mod go.sum || true
-          fi
-          go vet ./...
+      - name: Verify modules
+        run: go mod verify
 
       - name: Determine version info
         id: version

@@ -17,15 +17,22 @@ type Handler struct {
 	wsHub           *websocket.Hub
 	rateLimiter     *RateLimiter
 	alerter         *alerting.WebhookAlerter
-	excludePatterns []string // Patterns to exclude
+	excludePatterns []string // Patterns to exclude (as configured)
+	excludeLower    []string // same patterns, lowercased once at construction
 	bannedIPs       map[string]bool
 	bannedHostnames map[string]bool
 
+	dedup    *Deduplicator
+	logEvery bool
+
 	// Stats
-	totalReceived uint64
-	totalDropped  uint64
-	totalFiltered uint64
-	totalBanned   uint64
+	totalReceived     uint64
+	totalDropped      uint64
+	totalFiltered     uint64
+	totalBanned       uint64
+	totalSuppressed   uint64 // repetări suprimate de dedup
+	totalSummaries    uint64 // rânduri rezumat emise de dedup
+	totalQueueDropped uint64 // pachete UDP pierdute pentru că coada de procesare era plină
 }
 
 func NewHandler(storage storage.Storage, wsHub *websocket.Hub, alerter *alerting.WebhookAlerter, excludePatterns []string, bannedIPs []string, bannedHostnames []string, messagesPerSec int, burst int) *Handler {
@@ -41,14 +48,59 @@ func NewHandler(storage storage.Storage, wsHub *websocket.Hub, alerter *alerting
 		bannedHostnamesMap[strings.ToLower(strings.TrimSpace(hostname))] = true
 	}
 
+	excludeLower := make([]string, 0, len(excludePatterns))
+	for _, pattern := range excludePatterns {
+		excludeLower = append(excludeLower, strings.ToLower(pattern))
+	}
+
 	return &Handler{
 		storage:         storage,
 		wsHub:           wsHub,
 		alerter:         alerter,
 		excludePatterns: excludePatterns,
+		excludeLower:    excludeLower,
 		bannedIPs:       bannedIPsMap,
 		bannedHostnames: bannedHostnamesMap,
 		rateLimiter:     NewRateLimiter(messagesPerSec, burst),
+	}
+}
+
+// EnableDedup activează suprimarea mesajelor repetitive. Trebuie apelat o
+// singură dată, înainte de primirea traficului; Close() golește rezumatele.
+func (h *Handler) EnableDedup(cfg DedupConfig) {
+	h.dedup = NewDeduplicator(cfg, h.emitSummary)
+	h.dedup.Start()
+}
+
+// SetLogEveryMessage controlează linia de log per mesaj primit.
+func (h *Handler) SetLogEveryMessage(enabled bool) {
+	h.logEvery = enabled
+}
+
+// CountQueueDrop e apelat de listener când coada UDP e plină.
+func (h *Handler) CountQueueDrop() uint64 {
+	return atomic.AddUint64(&h.totalQueueDropped, 1)
+}
+
+// Close golește starea în așteptare (rezumatele dedup) înainte de oprire.
+func (h *Handler) Close() {
+	if h.dedup != nil {
+		h.dedup.Stop()
+	}
+}
+
+// emitSummary stochează și difuzează un rând rezumat produs de dedup.
+// Nu trece prin alertare: prima apariție a mesajului a alertat deja.
+func (h *Handler) emitSummary(message *types.SyslogMessage) {
+	atomic.AddUint64(&h.totalSummaries, 1)
+
+	if err := h.storage.Store(message); err != nil {
+		log.Printf("Error storing summary message: %v", err)
+	}
+	h.broadcastMessage(message)
+
+	if h.logEvery {
+		log.Printf("Summary from %s: %s", message.RemoteIP, message.Content)
 	}
 }
 
@@ -104,6 +156,12 @@ func (h *Handler) ProcessMessage(rawMessage string, remoteIP string, protocol st
 		return
 	}
 
+	// Suprimă repetările identice (după normalizare); prima apariție trece.
+	if h.dedup != nil && !h.dedup.Allow(message) {
+		atomic.AddUint64(&h.totalSuppressed, 1)
+		return
+	}
+
 	if h.alerter != nil {
 		h.alerter.SendAlert(message)
 	}
@@ -114,13 +172,18 @@ func (h *Handler) ProcessMessage(rawMessage string, remoteIP string, protocol st
 
 	h.broadcastMessage(message)
 
-	log.Printf("Received syslog message from %s via %s: %s", remoteIP, protocol, message.Content)
+	if h.logEvery {
+		log.Printf("Received syslog message from %s via %s: %s", remoteIP, protocol, message.Content)
+	}
 }
 
 func (h *Handler) shouldExclude(content string) bool {
+	if len(h.excludeLower) == 0 {
+		return false
+	}
 	contentLower := strings.ToLower(content)
-	for _, pattern := range h.excludePatterns {
-		if strings.Contains(contentLower, strings.ToLower(pattern)) {
+	for _, pattern := range h.excludeLower {
+		if strings.Contains(contentLower, pattern) {
 			return true
 		}
 	}
@@ -155,14 +218,24 @@ func (h *Handler) broadcastMessage(message *types.SyslogMessage) {
 func (h *Handler) GetStats() map[string]interface{} {
 	rlStats := h.rateLimiter.GetStats()
 
+	dedupTracked := 0
+	if h.dedup != nil {
+		dedupTracked = h.dedup.Len()
+	}
+
 	return map[string]interface{}{
-		"total_received":  atomic.LoadUint64(&h.totalReceived),
-		"total_dropped":   atomic.LoadUint64(&h.totalDropped),
-		"total_filtered":  atomic.LoadUint64(&h.totalFiltered),
-		"total_banned":    atomic.LoadUint64(&h.totalBanned),
-		"rate_limiter":    rlStats,
-		"exclude_filters": len(h.excludePatterns),
-		"banned_ips":      len(h.bannedIPs),
-		"banned_hosts":    len(h.bannedHostnames),
+		"total_received":      atomic.LoadUint64(&h.totalReceived),
+		"total_dropped":       atomic.LoadUint64(&h.totalDropped),
+		"total_filtered":      atomic.LoadUint64(&h.totalFiltered),
+		"total_banned":        atomic.LoadUint64(&h.totalBanned),
+		"total_suppressed":    atomic.LoadUint64(&h.totalSuppressed),
+		"total_summaries":     atomic.LoadUint64(&h.totalSummaries),
+		"total_queue_dropped": atomic.LoadUint64(&h.totalQueueDropped),
+		"dedup_enabled":       h.dedup != nil,
+		"dedup_tracked":       dedupTracked,
+		"rate_limiter":        rlStats,
+		"exclude_filters":     len(h.excludePatterns),
+		"banned_ips":          len(h.bannedIPs),
+		"banned_hosts":        len(h.bannedHostnames),
 	}
 }
