@@ -50,14 +50,21 @@ func NewFileStorage(baseDir string) (*FileStorage, error) {
 		countCacheTTL:  30 * time.Second, // Recalculăm de pe disc la fiecare 30 sec doar dacă e nevoie
 	}
 
-	// Warmup cache la pornire
-	go fs.warmupCache()
+	// Warmup sincron: la returnare cache-ul e consistent și niciun Store()
+	// nu poate rula în paralel cu el (altfel apăreau mesaje duplicate).
+	fs.warmupCache()
 
 	return fs, nil
 }
 
-// warmupCache populează cache-ul la pornirea aplicației
+// warmupCache populează cache-ul la pornirea aplicației.
+// Ține writeMutex ca să nu se intercaleze cu Store(): altfel un mesaj scris
+// pe disc între loadRecentFromDisk și prepend-ul din Store ajungea de două
+// ori în cache (o dată din warmup, o dată din Store) și totalul ieșea +1.
 func (fs *FileStorage) warmupCache() {
+	fs.writeMutex.Lock()
+	defer fs.writeMutex.Unlock()
+
 	fs.cacheMutex.Lock()
 	defer fs.cacheMutex.Unlock()
 
@@ -171,7 +178,7 @@ func (fs *FileStorage) GetRecentMessages(limit int) ([]*types.SyslogMessage, err
 // GetTotalMessageCount returnează numărul total de mesaje din Cache
 func (fs *FileStorage) GetTotalMessageCount() (int, error) {
 	fs.cacheMutex.RLock()
-	if time.Since(fs.countCachedAt) < fs.countCacheTTL && fs.totalCountCache > 0 {
+	if !fs.countCachedAt.IsZero() && time.Since(fs.countCachedAt) < fs.countCacheTTL {
 		count := fs.totalCountCache
 		fs.cacheMutex.RUnlock()
 		return count, nil
