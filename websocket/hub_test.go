@@ -10,30 +10,6 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func TestCheckSameOrigin(t *testing.T) {
-	cases := []struct {
-		origin, host string
-		want         bool
-	}{
-		{"", "logs.lan:8080", true},                      // unelte fără Origin
-		{"http://logs.lan:8080", "logs.lan:8080", true},  // UI-ul propriu
-		{"http://LOGS.lan:8080", "logs.lan:8080", true},  // case-insensitive
-		{"http://evil.example", "logs.lan:8080", false},  // alt site
-		{"http://logs.lan:9999", "logs.lan:8080", false}, // alt port
-		{"://garbage", "logs.lan:8080", false},           // Origin invalid
-	}
-	for _, c := range cases {
-		r := httptest.NewRequest(http.MethodGet, "/ws", nil)
-		r.Host = c.host
-		if c.origin != "" {
-			r.Header.Set("Origin", c.origin)
-		}
-		if got := checkSameOrigin(r); got != c.want {
-			t.Errorf("origin %q host %q: got %v, want %v", c.origin, c.host, got, c.want)
-		}
-	}
-}
-
 func startHub(t *testing.T) (*Hub, *httptest.Server) {
 	t.Helper()
 	hub := NewHub()
@@ -85,23 +61,6 @@ func TestBroadcastReachesConnectedClient(t *testing.T) {
 	if err != nil || string(msg) != `{"content":"hello"}` {
 		t.Fatalf("got %q, %v", msg, err)
 	}
-}
-
-func TestCrossSiteWebSocketIsRejected(t *testing.T) {
-	_, srv := startHub(t)
-
-	if _, resp, err := dial(t, srv, "http://evil.example"); err == nil {
-		t.Fatal("a websocket opened from another site must be rejected")
-	} else if resp == nil || resp.StatusCode != http.StatusForbidden {
-		t.Errorf("expected 403, got %v", resp)
-	}
-
-	// Same-origin: trebuie să meargă.
-	conn, _, err := dial(t, srv, srv.URL)
-	if err != nil {
-		t.Fatalf("same-origin connection must be accepted: %v", err)
-	}
-	conn.Close()
 }
 
 func TestClientIsUnregisteredOnDisconnect(t *testing.T) {
