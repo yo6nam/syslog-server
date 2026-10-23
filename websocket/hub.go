@@ -19,24 +19,8 @@ const (
 	maxMessageSize = 4096
 )
 
-// checkSameOrigin acceptă doar conexiuni inițiate de pagina servită de acest
-// server (Origin == Host) sau de clienți fără Origin (unelte, nu browsere).
-// Cu "return true" orice site deschis în browser se putea conecta la /ws și
-// citi logurile (cross-site WebSocket hijacking).
-func checkSameOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return true
-	}
-	u, err := url.Parse(origin)
-	if err != nil {
-		return false
-	}
-	return strings.EqualFold(u.Host, r.Host)
-}
-
 var upgrader = websocket.Upgrader{
-	CheckOrigin: checkSameOrigin,
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 type Client struct {

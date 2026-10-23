@@ -58,9 +58,10 @@ func NewFileStorage(baseDir string) (*FileStorage, error) {
 }
 
 // warmupCache populează cache-ul la pornirea aplicației.
-// Ține writeMutex ca să nu se intercaleze cu Store(): altfel un mesaj scris
-// pe disc între loadRecentFromDisk și prepend-ul din Store ajungea de două
-// ori în cache (o dată din warmup, o dată din Store) și totalul ieșea +1.
+// Ține writeMutex ca să nu se intercaleze cu Store() (bug-ul de duplicare
+// din commit-ul 0eef9d4). Numărarea completă NU se face aici: pe un director
+// cu luni de loguri ar bloca startup-ul. Lăsăm countCachedAt zero, iar primul
+// GetTotalMessageCount va recalcula lazy, la cerere.
 func (fs *FileStorage) warmupCache() {
 	fs.writeMutex.Lock()
 	defer fs.writeMutex.Unlock()
@@ -68,18 +69,12 @@ func (fs *FileStorage) warmupCache() {
 	fs.cacheMutex.Lock()
 	defer fs.cacheMutex.Unlock()
 
-	// Populează ultimele mesaje
 	messages, err := fs.loadRecentFromDisk(fs.maxRecentCache)
 	if err == nil {
 		fs.recentCache = messages
 	}
 
-	// Calculează count-ul inițial
-	count, err := fs.countFromDisk()
-	if err == nil {
-		fs.totalCountCache = count
-		fs.countCachedAt = time.Now()
-	}
+	fs.countCachedAt = time.Time{}
 }
 
 func (fs *FileStorage) Store(message *types.SyslogMessage) error {
@@ -423,27 +418,72 @@ func (fs *FileStorage) DeleteOldMessages(cutoffDate time.Time) (int, error) {
 	return deletedMessages, nil
 }
 
-// Helper: Încarcă mesaje recente de pe disc (pentru fallback sau warmup)
+// loadRecentFromDisk încarcă mesajele recente de pe disc pentru warmup/fallback.
+// Pentru a nu bloca startup-ul pe un director cu luni de loguri, citim doar
+// fișierele-zi din ultimele 72h (sau, dacă nu există, ultimele fișiere
+// disponibile) și ne oprim după warmupMaxMessages mesaje.
 func (fs *FileStorage) loadRecentFromDisk(limit int) ([]*types.SyslogMessage, error) {
+	const (
+		warmupMaxMessages = 5000
+		warmupMaxAge      = 72 * time.Hour
+	)
+
 	fs.readMutex.RLock()
 	defer fs.readMutex.RUnlock()
 
-	var allMessages []*types.SyslogMessage
 	files, err := filepath.Glob(filepath.Join(fs.baseDir, "syslog-*.json"))
 	if err != nil {
 		return nil, err
 	}
+	if len(files) == 0 {
+		return nil, nil
+	}
 
-	sort.Sort(sort.Reverse(sort.StringSlice(files)))
+	// Păstrăm doar fișierele-zi din ultimele 72h. Numele e syslog-YYYY-MM-DD.json,
+	// deci comparăm lexicografic ziua — suficient și fără parse de dată.
+	cutoff := time.Now().Add(-warmupMaxAge).Format("2006-01-02")
+	var recentFiles []string
+	for _, f := range files {
+		base := filepath.Base(f)
+		dayStr := strings.TrimSuffix(strings.TrimPrefix(base, "syslog-"), ".json")
+		if len(dayStr) != len("2006-01-02") {
+			continue // nume neașteptat — ignorăm
+		}
+		if dayStr >= cutoff {
+			recentFiles = append(recentFiles, f)
+		}
+	}
 
-	for _, file := range files {
+	// Dacă nu există nimic în ultimele 72h (ex. server oprit mai mult),
+	// cădem pe ultimele fișiere disponibile, ca să nu pornim cu cache gol.
+	if len(recentFiles) == 0 {
+		sort.Sort(sort.Reverse(sort.StringSlice(files)))
+		maxFiles := 3
+		if len(files) < maxFiles {
+			maxFiles = len(files)
+		}
+		recentFiles = files[:maxFiles]
+	}
+
+	// Cele mai noi primele, ca să umplem recentCache cu ce trebuie.
+	sort.Sort(sort.Reverse(sort.StringSlice(recentFiles)))
+
+	// Plafonul efectiv: nu mai mult de warmupMaxMessages, dar nici mai mult
+	// decât cere apelantul (limit) — warmup vrea maxRecentCache, fallback vrea N.
+	capMessages := limit * 2
+	if capMessages == 0 || capMessages > warmupMaxMessages {
+		capMessages = warmupMaxMessages
+	}
+
+	var allMessages []*types.SyslogMessage
+	for _, file := range recentFiles {
 		messages, err := fs.readJSONFileUnsafe(file)
 		if err != nil {
 			continue
 		}
 		allMessages = append(allMessages, messages...)
 
-		if len(allMessages) >= limit*2 {
+		if len(allMessages) >= capMessages {
 			break
 		}
 	}
@@ -452,7 +492,7 @@ func (fs *FileStorage) loadRecentFromDisk(limit int) ([]*types.SyslogMessage, er
 		return allMessages[i].Timestamp.After(allMessages[j].Timestamp)
 	})
 
-	if len(allMessages) > limit {
+	if len(allMessages) > limit && limit > 0 {
 		allMessages = allMessages[:limit]
 	}
 
