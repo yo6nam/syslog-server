@@ -221,6 +221,15 @@ Other options worth knowing:
 
 Invalid values (for example a rate limit of 0) are repaired at startup and reported as warnings.
 
+**Linux:** the kernel silently caps `syslog.udp_read_buffer_bytes` at `net.core.rmem_max` (208 KiB by default), and a burst larger than the buffer is dropped before the server can read it. The server logs a warning at startup when that happens. To get the full 4 MiB:
+
+```bash
+sudo sysctl -w net.core.rmem_max=4194304
+echo 'net.core.rmem_max=4194304' | sudo tee /etc/sysctl.d/90-syslog-server.conf
+```
+
+Dropped datagrams show up as `RcvbufErrors` in `/proc/net/snmp` (`netstat -su`).
+
 ---
 
 ## Behind a reverse proxy (Apache example)

@@ -4,16 +4,35 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-// ServerConfig reglează comportamentul listenerilor.
+var rmemMaxPath = "/proc/sys/net/core/rmem_max"
+
+func readBufferCapWarning(requested int, path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	max, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || requested <= max {
+		return ""
+	}
+	return fmt.Sprintf("⚠️ UDP read buffer: asked for %d bytes but the kernel caps it at net.core.rmem_max=%d; "+
+		"bursts will be dropped before the server can read them (RcvbufErrors in /proc/net/snmp). "+
+		"Raise it with: sysctl -w net.core.rmem_max=%d (persist it in /etc/sysctl.d/)", requested, max, requested)
+}
+
 type ServerConfig struct {
-	UDPReadBufferBytes int // SO_RCVBUF; 0 = valoarea implicită a sistemului
-	UDPQueueSize       int // pachete așteptând procesarea
+	UDPReadBufferBytes int
+	UDPQueueSize       int
 	MaxTCPConnections  int
 }
 
@@ -49,8 +68,6 @@ func NewServerWithConfig(handler *Handler, cfg ServerConfig) *Server {
 	}
 }
 
-// Wait așteaptă oprirea tuturor goroutine-urilor listenerilor (după anularea
-// contextului), cel mult timeout. Întoarce false dacă s-a depășit timpul.
 func (s *Server) Wait(timeout time.Duration) bool {
 	done := make(chan struct{})
 	go func() {
@@ -66,9 +83,6 @@ func (s *Server) Wait(timeout time.Duration) bool {
 	}
 }
 
-// hostOnly extrage IP-ul dintr-o adresă "ip:port" (sau "[v6]:port"). Fără asta,
-// ban-list-ul și rate limiter-ul vedeau pe TCP câte o "identitate" nouă per
-// conexiune (portul efemer) și IP-ul se salva cu port.
 func hostOnly(addr string) string {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -97,8 +111,6 @@ func (s *Server) closeAllConns() {
 	}
 }
 
-// StartTCPWithContext deschide listenerul TCP și întoarce după bind (erorile de
-// bind sunt returnate, nu fatale). Se oprește la anularea contextului.
 func (s *Server) StartTCPWithContext(ctx context.Context, addr string) (net.Listener, error) {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -136,7 +148,6 @@ func (s *Server) acceptLoop(ctx context.Context, listener net.Listener) {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return
 			}
-			// Eroare persistentă (ex. EMFILE): backoff, nu buclă fierbinte.
 			if delay == 0 {
 				delay = 5 * time.Millisecond
 			} else if delay *= 2; delay > time.Second {
@@ -179,8 +190,6 @@ func (s *Server) handleTCPConnection(conn net.Conn) {
 		conn.Close()
 	}()
 
-	// Keepalive detectează peer-urile dispărute fără să închidă conexiunile
-	// legitime, doar idle.
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(60 * time.Second)
@@ -209,11 +218,6 @@ type udpPacket struct {
 	ip   string
 }
 
-// StartUDPWithContext deschide socket-ul UDP. Citirea (rapidă) e separată de
-// procesare printr-o coadă cu UN singur consumator: nu se mai pierd pachete în
-// buffer-ul kernelului cât timp se scrie pe disc și ordinea mesajelor rămâne
-// cea de sosire (înainte: un goroutine per pachet). Dacă și coada se umple,
-// pierderea e numărată și vizibilă în statistici.
 func (s *Server) StartUDPWithContext(ctx context.Context, addr string) (*net.UDPConn, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -228,6 +232,8 @@ func (s *Server) StartUDPWithContext(ctx context.Context, addr string) (*net.UDP
 	if s.cfg.UDPReadBufferBytes > 0 {
 		if err := conn.SetReadBuffer(s.cfg.UDPReadBufferBytes); err != nil {
 			log.Printf("⚠️ Could not set UDP read buffer to %d bytes: %v", s.cfg.UDPReadBufferBytes, err)
+		} else if warning := readBufferCapWarning(s.cfg.UDPReadBufferBytes, rmemMaxPath); warning != "" {
+			log.Println(warning)
 		}
 	}
 
@@ -239,12 +245,12 @@ func (s *Server) StartUDPWithContext(ctx context.Context, addr string) (*net.UDP
 		<-ctx.Done()
 		conn.Close()
 	}()
-	go func() { // cititor
+	go func() {
 		defer s.wg.Done()
 		defer close(queue)
 		s.udpReadLoop(ctx, conn, queue)
 	}()
-	go func() { // consumator unic
+	go func() {
 		defer s.wg.Done()
 		for packet := range queue {
 			s.handler.ProcessMessage(packet.data, packet.ip, "UDP")
@@ -266,7 +272,7 @@ func (s *Server) udpReadLoop(ctx context.Context, conn *net.UDPConn, queue chan<
 				return
 			}
 			log.Printf("UDP read error: %v", err)
-			time.Sleep(10 * time.Millisecond) // fără buclă fierbinte la erori persistente
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 
