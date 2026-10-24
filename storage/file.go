@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -30,13 +32,14 @@ type FileStorage struct {
 	writeMutex sync.Mutex
 	readMutex  sync.RWMutex
 
-	// 🚀 CACHE IN-MEMORY
-	recentCache     []*types.SyslogMessage
-	maxRecentCache  int
-	totalCountCache int
-	countCachedAt   time.Time
-	countCacheTTL   time.Duration
-	cacheMutex      sync.RWMutex
+	// 🚀 CACHE IN-MEMORY al ultimelor mesaje (pentru prima pagină / live view)
+	recentCache    []*types.SyslogMessage
+	maxRecentCache int
+	cacheMutex     sync.RWMutex
+
+	// Index de numărare pe fișier; discul e sursa de adevăr (vezi file_index.go).
+	counts  map[string]*fileCount
+	countMu sync.Mutex
 }
 
 func NewFileStorage(baseDir string) (*FileStorage, error) {
@@ -46,35 +49,16 @@ func NewFileStorage(baseDir string) (*FileStorage, error) {
 
 	fs := &FileStorage{
 		baseDir:        baseDir,
-		maxRecentCache: 500,              // Păstrăm ultimele 500 mesaje direct în memorie
-		countCacheTTL:  30 * time.Second, // Recalculăm de pe disc la fiecare 30 sec doar dacă e nevoie
+		maxRecentCache: 500, // Păstrăm ultimele 500 mesaje direct în memorie
+		counts:         make(map[string]*fileCount),
 	}
 
-	// Warmup sincron: la returnare cache-ul e consistent și niciun Store()
-	// nu poate rula în paralel cu el (altfel apăreau mesaje duplicate).
-	fs.warmupCache()
+	// Warmup SINCRON și rapid (citește doar coada fișierelor): înainte rula
+	// asincron, ținea cacheMutex cât citea tot istoricul (blocând Store()) și
+	// se bătea cu Store() pe contor și pe recentCache.
+	fs.warmupRecent()
 
 	return fs, nil
-}
-
-// warmupCache populează cache-ul la pornirea aplicației.
-// Ține writeMutex ca să nu se intercaleze cu Store() (bug-ul de duplicare
-// din commit-ul 0eef9d4). Numărarea completă NU se face aici: pe un director
-// cu luni de loguri ar bloca startup-ul. Lăsăm countCachedAt zero, iar primul
-// GetTotalMessageCount va recalcula lazy, la cerere.
-func (fs *FileStorage) warmupCache() {
-	fs.writeMutex.Lock()
-	defer fs.writeMutex.Unlock()
-
-	fs.cacheMutex.Lock()
-	defer fs.cacheMutex.Unlock()
-
-	messages, err := fs.loadRecentFromDisk(fs.maxRecentCache)
-	if err == nil {
-		fs.recentCache = messages
-	}
-
-	fs.countCachedAt = time.Time{}
 }
 
 func (fs *FileStorage) Store(message *types.SyslogMessage) error {
@@ -143,8 +127,6 @@ func (fs *FileStorage) Store(message *types.SyslogMessage) error {
 	if len(fs.recentCache) > fs.maxRecentCache {
 		fs.recentCache = fs.recentCache[:fs.maxRecentCache]
 	}
-	// Incrementează contorul total
-	fs.totalCountCache++
 	fs.cacheMutex.Unlock()
 
 	return nil
@@ -170,28 +152,10 @@ func (fs *FileStorage) GetRecentMessages(limit int) ([]*types.SyslogMessage, err
 	return fs.loadRecentFromDisk(limit)
 }
 
-// GetTotalMessageCount returnează numărul total de mesaje din Cache
+// GetTotalMessageCount returnează numărul total de mesaje, calculat incremental
+// de pe disc (vezi totalFromIndex): exact, fără contor în memorie care să diverge.
 func (fs *FileStorage) GetTotalMessageCount() (int, error) {
-	fs.cacheMutex.RLock()
-	if !fs.countCachedAt.IsZero() && time.Since(fs.countCachedAt) < fs.countCacheTTL {
-		count := fs.totalCountCache
-		fs.cacheMutex.RUnlock()
-		return count, nil
-	}
-	fs.cacheMutex.RUnlock()
-
-	// Recalculează de pe disc dacă e primul apel / expiră TTL
-	count, err := fs.countFromDisk()
-	if err != nil {
-		return 0, err
-	}
-
-	fs.cacheMutex.Lock()
-	fs.totalCountCache = count
-	fs.countCachedAt = time.Now()
-	fs.cacheMutex.Unlock()
-
-	return count, nil
+	return fs.totalFromIndex()
 }
 
 // GetMessagesPaginated folosește cache-ul pentru prima pagină sau citește optimizat
@@ -408,82 +372,32 @@ func (fs *FileStorage) DeleteOldMessages(cutoffDate time.Time) (int, error) {
 		}
 	}
 
-	// Invalidăm cache-ul de count (nu recentCache — mesajele șterse sunt oricum
-	// mult mai vechi decât ce ține recentCache) ca următorul apel să recalculeze
-	// corect numărul total de pe disc, reflectând fișierele șterse.
-	fs.cacheMutex.Lock()
-	fs.countCachedAt = time.Time{}
-	fs.cacheMutex.Unlock()
-
+	// Nu e nimic de invalidat: indexul de numărare observă singur fișierele
+	// dispărute, iar recentCache conține mesaje mult mai noi decât cele șterse.
 	return deletedMessages, nil
 }
 
-// loadRecentFromDisk încarcă mesajele recente de pe disc pentru warmup/fallback.
-// Pentru a nu bloca startup-ul pe un director cu luni de loguri, citim doar
-// fișierele-zi din ultimele 72h (sau, dacă nu există, ultimele fișiere
-// disponibile) și ne oprim după warmupMaxMessages mesaje.
+// Helper: Încarcă mesaje recente de pe disc (pentru fallback sau warmup)
 func (fs *FileStorage) loadRecentFromDisk(limit int) ([]*types.SyslogMessage, error) {
-	const (
-		warmupMaxMessages = 5000
-		warmupMaxAge      = 72 * time.Hour
-	)
-
 	fs.readMutex.RLock()
 	defer fs.readMutex.RUnlock()
 
+	var allMessages []*types.SyslogMessage
 	files, err := filepath.Glob(filepath.Join(fs.baseDir, "syslog-*.json"))
 	if err != nil {
 		return nil, err
 	}
-	if len(files) == 0 {
-		return nil, nil
-	}
 
-	// Păstrăm doar fișierele-zi din ultimele 72h. Numele e syslog-YYYY-MM-DD.json,
-	// deci comparăm lexicografic ziua — suficient și fără parse de dată.
-	cutoff := time.Now().Add(-warmupMaxAge).Format("2006-01-02")
-	var recentFiles []string
-	for _, f := range files {
-		base := filepath.Base(f)
-		dayStr := strings.TrimSuffix(strings.TrimPrefix(base, "syslog-"), ".json")
-		if len(dayStr) != len("2006-01-02") {
-			continue // nume neașteptat — ignorăm
-		}
-		if dayStr >= cutoff {
-			recentFiles = append(recentFiles, f)
-		}
-	}
+	sort.Sort(sort.Reverse(sort.StringSlice(files)))
 
-	// Dacă nu există nimic în ultimele 72h (ex. server oprit mai mult),
-	// cădem pe ultimele fișiere disponibile, ca să nu pornim cu cache gol.
-	if len(recentFiles) == 0 {
-		sort.Sort(sort.Reverse(sort.StringSlice(files)))
-		maxFiles := 3
-		if len(files) < maxFiles {
-			maxFiles = len(files)
-		}
-		recentFiles = files[:maxFiles]
-	}
-
-	// Cele mai noi primele, ca să umplem recentCache cu ce trebuie.
-	sort.Sort(sort.Reverse(sort.StringSlice(recentFiles)))
-
-	// Plafonul efectiv: nu mai mult de warmupMaxMessages, dar nici mai mult
-	// decât cere apelantul (limit) — warmup vrea maxRecentCache, fallback vrea N.
-	capMessages := limit * 2
-	if capMessages == 0 || capMessages > warmupMaxMessages {
-		capMessages = warmupMaxMessages
-	}
-
-	var allMessages []*types.SyslogMessage
-	for _, file := range recentFiles {
+	for _, file := range files {
 		messages, err := fs.readJSONFileUnsafe(file)
 		if err != nil {
 			continue
 		}
 		allMessages = append(allMessages, messages...)
 
-		if len(allMessages) >= capMessages {
+		if len(allMessages) >= limit*2 {
 			break
 		}
 	}
@@ -492,35 +406,23 @@ func (fs *FileStorage) loadRecentFromDisk(limit int) ([]*types.SyslogMessage, er
 		return allMessages[i].Timestamp.After(allMessages[j].Timestamp)
 	})
 
-	if len(allMessages) > limit && limit > 0 {
+	if len(allMessages) > limit {
 		allMessages = allMessages[:limit]
 	}
 
 	return allMessages, nil
 }
 
-// Helper: Numără mesajele de pe disc
-func (fs *FileStorage) countFromDisk() (int, error) {
-	fs.readMutex.RLock()
-	defer fs.readMutex.RUnlock()
-
-	var count int
-	files, err := filepath.Glob(filepath.Join(fs.baseDir, "syslog-*.json"))
-	if err != nil {
-		return 0, err
-	}
-
-	for _, file := range files {
-		messages, err := fs.readJSONFileUnsafe(file)
-		if err != nil {
-			continue
-		}
-		count += len(messages)
-	}
-
-	return count, nil
-}
-
+// readJSONFileUnsafe citește un fișier JSON-lines (un mesaj pe linie). Fiecare
+// linie e parsată independent; liniile corupte, neterminate sau pline de NUL
+// sunt sărite.
+//
+// Varianta veche folosea json.Decoder cu `for decoder.More() { if err :=
+// decoder.Decode(..); err != nil { continue } }`. După o eroare de sintaxă
+// Decoder-ul NU avansează: Decode întoarce aceeași eroare la nesfârșit, iar
+// More() rămâne true, deci o singură linie coruptă (de exemplu cea rămasă
+// neterminată după un restart sau o cădere de curent) bloca citirea într-o
+// buclă infinită, cu un nucleu la 100% CPU.
 func (fs *FileStorage) readJSONFileUnsafe(filename string) ([]*types.SyslogMessage, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -529,19 +431,23 @@ func (fs *FileStorage) readJSONFileUnsafe(filename string) ([]*types.SyslogMessa
 	defer file.Close()
 
 	var messages []*types.SyslogMessage
-	decoder := json.NewDecoder(file)
+	reader := bufio.NewReaderSize(file, 64*1024)
 
-	for decoder.More() {
-		var msgData map[string]interface{}
-		if err := decoder.Decode(&msgData); err != nil {
-			continue
+	for {
+		line, readErr := reader.ReadBytes('\n') // crește după nevoie: fără limită de lungime a liniei
+
+		if len(bytes.TrimSpace(line)) > 0 {
+			var msgData map[string]interface{}
+			if err := json.Unmarshal(line, &msgData); err == nil {
+				if msg, err := fs.parseMessageFromJSON(msgData); err == nil {
+					messages = append(messages, msg)
+				}
+			}
 		}
 
-		msg, err := fs.parseMessageFromJSON(msgData)
-		if err != nil {
-			continue
+		if readErr != nil { // io.EOF sau eroare de citire: terminăm oricum
+			break
 		}
-		messages = append(messages, msg)
 	}
 
 	return messages, nil

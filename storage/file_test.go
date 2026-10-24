@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -239,5 +241,271 @@ func BenchmarkStore(b *testing.B) {
 		if err := fs.Store(msg); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// Regresie pentru eșecul din CI ("total = 6, want 5"): un Store() concurent cu
+// pornirea storage-ului nu trebuie să fie numărat de două ori sau să apară
+// dublat în recentCache. Repetat de multe ori, ca să dea race-ului ocazia să apară.
+func TestStoreDuringStartupIsNotDoubleCountedOrDuplicated(t *testing.T) {
+	for iteration := 0; iteration < 40; iteration++ {
+		dir := t.TempDir()
+		writeDay(t, dir, time.Now().UTC().AddDate(0, 0, -1), 100, plain)
+
+		fs, err := NewFileStorage(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		for w := 0; w < 4; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for i := 0; i < 25; i++ {
+					fs.Store(&types.SyslogMessage{
+						Timestamp: time.Now(), Hostname: "h", Tag: "t",
+						Content:  fmt.Sprintf("new-%d-%d", w, i),
+						Severity: 6, Facility: 1,
+					})
+				}
+			}(w)
+		}
+		wg.Wait()
+
+		total, err := fs.GetTotalMessageCount()
+		if err != nil || total != 200 {
+			t.Fatalf("iteration %d: total = %d, want 200 (100 existing + 100 new)", iteration, total)
+		}
+
+		recent, _ := fs.GetRecentMessages(200)
+		seen := map[string]bool{}
+		for _, m := range recent {
+			if seen[m.Content] {
+				t.Fatalf("iteration %d: %q appears twice in the recent cache", iteration, m.Content)
+			}
+			seen[m.Content] = true
+		}
+		if len(recent) != 200 {
+			t.Fatalf("iteration %d: recent cache holds %d messages, want 200", iteration, len(recent))
+		}
+	}
+}
+
+func TestCountIsIncrementalAndFollowsTheDisk(t *testing.T) {
+	_, dir := newFS(t)
+	fs, _ := NewFileStorage(dir)
+
+	count := func() int {
+		t.Helper()
+		n, err := fs.GetTotalMessageCount()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	if count() != 0 {
+		t.Fatal("empty directory must count 0")
+	}
+
+	path := filepath.Join(dir, "syslog-2026-08-13.json")
+	os.WriteFile(path, []byte("{\"a\":1}\n{\"b\":"), 0644) // a doua linie e încă în scriere
+	if got := count(); got != 1 {
+		t.Errorf("an unfinished line must not be counted yet, got %d", got)
+	}
+
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	f.WriteString("2}\n{\"c\":3}\n")
+	f.Close()
+	if got := count(); got != 3 {
+		t.Errorf("after the line is finished and one more appended: got %d, want 3", got)
+	}
+
+	os.WriteFile(path, []byte("{\"x\":1}\n"), 0644) // trunchiat/rescris
+	if got := count(); got != 1 {
+		t.Errorf("a shrunk file must be recounted from scratch, got %d", got)
+	}
+
+	writeDay(t, dir, day(2026, 8, 14), 7, plain)
+	if got := count(); got != 8 {
+		t.Errorf("a new day file must be picked up, got %d, want 8", got)
+	}
+
+	os.Remove(filepath.Join(dir, "syslog-2026-08-14.json")) // ca la retenție
+	if got := count(); got != 1 {
+		t.Errorf("a removed file must stop counting, got %d, want 1", got)
+	}
+}
+
+func TestWarmupLoadsTheNewestMessagesFromTheTail(t *testing.T) {
+	old := tailChunkSize
+	tailChunkSize = 300 // forțează mai multe dublări ale ferestrei și linii tăiate la margine
+	defer func() { tailChunkSize = old }()
+
+	_, dir := newFS(t)
+	writeDay(t, dir, day(2026, 8, 12), 450, func(i int) string { return fmt.Sprintf("old-%04d", i) })
+	writeDay(t, dir, day(2026, 8, 13), 2000, func(i int) string { return fmt.Sprintf("new-%04d", i) })
+
+	fs, err := NewFileStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recent, _ := fs.GetRecentMessages(500)
+	if len(recent) != 500 {
+		t.Fatalf("recent cache = %d messages, want 500", len(recent))
+	}
+	if recent[0].Content != "new-1999" || recent[499].Content != "new-1500" {
+		t.Errorf("must hold the newest 500 (new-1999 .. new-1500), got %q .. %q", recent[0].Content, recent[499].Content)
+	}
+	for i := 1; i < len(recent); i++ {
+		if recent[i].Timestamp.After(recent[i-1].Timestamp) {
+			t.Fatalf("cache not newest-first at position %d", i)
+		}
+	}
+}
+
+func TestWarmupSpansFilesWhenTheNewestDayIsShort(t *testing.T) {
+	_, dir := newFS(t)
+	writeDay(t, dir, day(2026, 8, 12), 450, func(i int) string { return fmt.Sprintf("old-%04d", i) })
+	writeDay(t, dir, day(2026, 8, 13), 50, func(i int) string { return fmt.Sprintf("new-%04d", i) })
+
+	fs, _ := NewFileStorage(dir)
+	recent, _ := fs.GetRecentMessages(500)
+
+	if len(recent) != 500 || recent[0].Content != "new-0049" || recent[49].Content != "new-0000" || recent[50].Content != "old-0449" {
+		t.Fatalf("must continue into the previous day: len=%d first=%q [49]=%q [50]=%q",
+			len(recent), recent[0].Content, recent[49].Content, recent[50].Content)
+	}
+}
+
+func TestWarmupIgnoresCorruptOrUnfinishedLines(t *testing.T) {
+	_, dir := newFS(t)
+	good := `{"timestamp":"2026-08-13T10:00:00Z","hostname":"h","content":"ok","severity":6,"facility":1}`
+	os.WriteFile(filepath.Join(dir, "syslog-2026-08-13.json"),
+		[]byte(good+"\nnot json at all\n"+good+"\n{\"timestamp\":\"2026-08-13T11:00"), 0644)
+
+	fs, _ := NewFileStorage(dir)
+	recent, _ := fs.GetRecentMessages(10)
+	if len(recent) != 2 {
+		t.Errorf("only the 2 valid lines must load, got %d", len(recent))
+	}
+}
+
+func TestCountOnlyCountsJSONDayFiles(t *testing.T) {
+	_, dir := newFS(t)
+	writeDay(t, dir, day(2026, 8, 13), 4, plain) // scrie și .log-ul zilei
+	fs, _ := NewFileStorage(dir)
+
+	if got, _ := fs.GetTotalMessageCount(); got != 4 {
+		t.Errorf("count = %d, want 4 (the .log text file must not be counted)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fișiere-zi corupte. Un restart sau o cădere de curent poate lăsa o linie
+// neterminată sau blocuri de NUL la finalul fișierului de azi. Vechiul cod
+// (json.Decoder cu `continue` pe eroare) intra atunci într-o buclă infinită, cu
+// un nucleu la 100% CPU, pe ORICARE dintre căile de citire.
+// ---------------------------------------------------------------------------
+
+const validJSONLine = `{"timestamp":"2026-08-13T10:00:00Z","hostname":"h","tag":"t","content":"ok","severity":6,"facility":1,"remote_ip":"10.0.0.1","raw_message":"raw"}`
+
+// mustFinish pică repede (în loc să blocheze toată suita) dacă fn nu se termină.
+func mustFinish(t *testing.T, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s did not return within 5s: infinite loop on a corrupt line?", what)
+	}
+}
+
+func TestCorruptDayFilesNeverHangAndKeepTheValidMessages(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    int // mesaje valide care trebuie recuperate
+	}{
+		{"truncated last line", validJSONLine + "\n" + validJSONLine + "\n" + `{"timestamp":"2026-08-13T11:00`, 2},
+		{"NUL block between lines", validJSONLine + "\n\x00\x00\x00\x00\n" + validJSONLine + "\n", 2},
+		{"NUL tail without newline", validJSONLine + "\n" + validJSONLine + "\n" + strings.Repeat("\x00", 4096), 2},
+		{"garbage line in the middle", validJSONLine + "\nnot json at all\n" + validJSONLine + "\n", 2},
+		{"only garbage", "garbage\n{{{{\n]]]\n", 0},
+		{"empty file", "", 0},
+		{"CRLF and blank lines", validJSONLine + "\r\n\r\n" + validJSONLine + "\r\n", 2},
+		{"unterminated last valid line", validJSONLine + "\n" + validJSONLine, 2},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			os.WriteFile(filepath.Join(dir, "syslog-2026-08-13.json"), []byte(c.content), 0644)
+			fs, err := NewFileStorage(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			from, to := day(2026, 8, 13), time.Date(2026, 8, 13, 23, 59, 59, 0, time.UTC)
+
+			mustFinish(t, "GetMessagesByDate", func() {
+				msgs, err := fs.GetMessagesByDate(from)
+				if err != nil || len(msgs) != c.want {
+					t.Errorf("GetMessagesByDate: %d messages (err %v), want %d", len(msgs), err, c.want)
+				}
+			})
+			mustFinish(t, "SearchMessages", func() {
+				_, total, err := fs.SearchMessages("", "", -1, -1, from, to, 100, 0)
+				if err != nil || total != c.want {
+					t.Errorf("SearchMessages: total %d (err %v), want %d", total, err, c.want)
+				}
+			})
+			mustFinish(t, "GetRecentMessages (disk fallback)", func() {
+				// limit > cache: forțează citirea completă de pe disc
+				if msgs, err := fs.GetRecentMessages(600); err != nil || len(msgs) != c.want {
+					t.Errorf("GetRecentMessages: %d messages (err %v), want %d", len(msgs), err, c.want)
+				}
+			})
+			mustFinish(t, "GetMessagesPaginated (disk fallback)", func() {
+				if _, _, err := fs.GetMessagesPaginated(1, 10); err != nil {
+					t.Errorf("GetMessagesPaginated: %v", err)
+				}
+			})
+			mustFinish(t, "GetTotalMessageCount", func() {
+				if _, err := fs.GetTotalMessageCount(); err != nil {
+					t.Errorf("GetTotalMessageCount: %v", err)
+				}
+			})
+			mustFinish(t, "DeleteOldMessages", func() {
+				if _, err := fs.DeleteOldMessages(time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)); err != nil {
+					t.Errorf("DeleteOldMessages: %v", err)
+				}
+			})
+		})
+	}
+}
+
+// Un mesaj foarte lung (raw_message de sute de KB) trebuie citit întreg; o
+// "optimizare" cu bufio.Scanner (limită de 64 KB/linie) l-ar pierde în tăcere.
+func TestVeryLongValidLineIsRead(t *testing.T) {
+	dir := t.TempDir()
+	long := fmt.Sprintf(`{"timestamp":"2026-08-13T10:00:00Z","hostname":"h","content":"big","severity":6,"facility":1,"raw_message":%q}`,
+		strings.Repeat("x", 300*1024))
+	os.WriteFile(filepath.Join(dir, "syslog-2026-08-13.json"), []byte(validJSONLine+"\n"+long+"\n"+validJSONLine+"\n"), 0644)
+	fs, _ := NewFileStorage(dir)
+
+	msgs, err := fs.GetMessagesByDate(day(2026, 8, 13))
+	if err != nil || len(msgs) != 3 {
+		t.Fatalf("got %d messages (err %v), want 3 including the 300 KB one", len(msgs), err)
+	}
+	if len(msgs[1].RawMessage) != 300*1024 {
+		t.Errorf("long message truncated: %d bytes", len(msgs[1].RawMessage))
 	}
 }
