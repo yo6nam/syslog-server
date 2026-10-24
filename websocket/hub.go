@@ -3,6 +3,8 @@ package websocket
 import (
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,10 +19,6 @@ const (
 	maxMessageSize = 4096
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
-
 type Client struct {
 	hub  *Hub
 	conn *websocket.Conn
@@ -34,27 +32,69 @@ type Hub struct {
 	unregister chan *Client
 	mutex      sync.RWMutex
 
-	dropped     uint64 // mesaje pierdute pentru că canalul de broadcast era plin
-	lastDropLog int64  // unix nano al ultimei linii de log despre drop-uri
+	dropped     uint64
+	lastDropLog int64
+
+	upgrader       websocket.Upgrader
+	originsMu      sync.RWMutex
+	allowedOrigins map[string]bool
 }
 
 func NewHub() *Hub {
-	return &Hub{
-		broadcast:  make(chan []byte, 256), // Buffered pentru a preveni blocking
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		clients:    make(map[*Client]bool),
+	h := &Hub{
+		broadcast:      make(chan []byte, 256),
+		register:       make(chan *Client),
+		unregister:     make(chan *Client),
+		clients:        make(map[*Client]bool),
+		allowedOrigins: make(map[string]bool),
 	}
+	h.upgrader = websocket.Upgrader{CheckOrigin: h.checkOrigin}
+	return h
 }
 
-// ClientCount întoarce numărul de clienți conectați.
+func (h *Hub) SetAllowedOrigins(origins []string) {
+	allowed := make(map[string]bool, len(origins))
+	for _, origin := range origins {
+		if normalized := normalizeOrigin(origin); normalized != "" {
+			allowed[normalized] = true
+		}
+	}
+
+	h.originsMu.Lock()
+	h.allowedOrigins = allowed
+	h.originsMu.Unlock()
+}
+
+func normalizeOrigin(origin string) string {
+	return strings.ToLower(strings.TrimRight(strings.TrimSpace(origin), "/"))
+}
+
+func (h *Hub) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+
+	if u, err := url.Parse(origin); err == nil && u.Host != "" && strings.EqualFold(u.Host, r.Host) {
+		return true
+	}
+
+	h.originsMu.RLock()
+	allowed := h.allowedOrigins["*"] || h.allowedOrigins[normalizeOrigin(origin)]
+	h.originsMu.RUnlock()
+
+	if !allowed {
+		log.Printf("WebSocket origin %q rejected (request Host %q); add it to web.allowed_origins if it is yours", origin, r.Host)
+	}
+	return allowed
+}
+
 func (h *Hub) ClientCount() int {
 	h.mutex.RLock()
 	defer h.mutex.RUnlock()
 	return len(h.clients)
 }
 
-// Dropped întoarce câte mesaje nu au putut fi puse în coada de broadcast.
 func (h *Hub) Dropped() uint64 {
 	return atomic.LoadUint64(&h.dropped)
 }
@@ -96,13 +136,11 @@ func (h *Hub) Run() {
 }
 
 func (h *Hub) Broadcast(message []byte) {
-	// Non-blocking send pentru a preveni deadlock-uri
 	select {
 	case h.broadcast <- message:
 	default:
 		total := atomic.AddUint64(&h.dropped, 1)
 
-		// O singură linie la cel mult 10s, nu una per mesaj pierdut.
 		now := time.Now().UnixNano()
 		last := atomic.LoadInt64(&h.lastDropLog)
 		if now-last > int64(10*time.Second) && atomic.CompareAndSwapInt64(&h.lastDropLog, last, now) {
@@ -112,7 +150,7 @@ func (h *Hub) Broadcast(message []byte) {
 }
 
 func (h *Hub) ServeWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("WebSocket upgrade error:", err)
 		return
@@ -126,7 +164,6 @@ func (h *Hub) ServeWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	h.register <- client
 
-	// Start goroutines for this client
 	go client.writePump()
 	go client.readPump()
 }
@@ -137,8 +174,6 @@ func (c *Client) readPump() {
 		c.conn.Close()
 	}()
 
-	// Ping/pong: fără ele, un client dispărut fără FIN (Wi-Fi căzut, laptop
-	// închis) rămânea conectat până îi se umplea bufferul.
 	c.conn.SetReadLimit(maxMessageSize)
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error {
@@ -168,7 +203,6 @@ func (c *Client) writePump() {
 		case message, ok := <-c.send:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
-				// Hub closed the channel
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}

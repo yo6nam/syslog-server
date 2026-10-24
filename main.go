@@ -86,7 +86,11 @@ func main() {
 	}
 
 	wsHub := websocket.NewHub()
+	wsHub.SetAllowedOrigins(config.Web.AllowedOrigins)
 	go wsHub.Run()
+	if len(config.Web.AllowedOrigins) > 0 {
+		log.Printf("🌐 WebSocket allowed origins (besides same-origin): %v", config.Web.AllowedOrigins)
+	}
 
 	// Create alerter
 	alerter := alerting.NewWebhookAlerter(*config)

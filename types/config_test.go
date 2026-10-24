@@ -100,3 +100,25 @@ func TestValidateLeavesGoodConfigAlone(t *testing.T) {
 		t.Errorf("the default configuration must validate cleanly, got %v", warnings)
 	}
 }
+
+func TestAllowedOriginsDefaultAndValidation(t *testing.T) {
+	cfg, _, _ := LoadConfig("")
+	if cfg.Web.AllowedOrigins == nil || len(cfg.Web.AllowedOrigins) != 0 {
+		t.Errorf("allowed_origins must default to an empty list, got %v", cfg.Web.AllowedOrigins)
+	}
+
+	cfg.Web.AllowedOrigins = []string{"https://rolink.network"}
+	if w := cfg.Validate(); len(w) != 0 {
+		t.Errorf("a well-formed origin must not warn: %v", w)
+	}
+
+	cfg.Web.AllowedOrigins = []string{"rolink.network"}
+	if w := strings.Join(cfg.Validate(), "\n"); !strings.Contains(w, "https://host") {
+		t.Errorf("an origin without a scheme must be flagged: %q", w)
+	}
+
+	cfg.Web.AllowedOrigins = []string{"*"}
+	if w := strings.Join(cfg.Validate(), "\n"); !strings.Contains(w, "any website") {
+		t.Errorf(`"*" must produce a warning: %q`, w)
+	}
+}

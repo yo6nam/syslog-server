@@ -217,8 +217,39 @@ Other options worth knowing:
 | `syslog.log_every_message` | false | one log line per received message (noisy at volume) |
 | `web.basic_auth_user` / `web.basic_auth_password` | empty | protect UI, API and WebSocket |
 | `web.cors_allow_origin` | empty | allow one external origin to call the API |
+| `web.allowed_origins` | empty | origins allowed to open the WebSocket besides same-origin, e.g. `["https://logs.example.com"]` (needed behind a reverse proxy that does not preserve `Host`) |
 
 Invalid values (for example a rate limit of 0) are repaired at startup and reported as warnings.
+
+---
+
+## Behind a reverse proxy (Apache example)
+
+The UI uses relative URLs, including the WebSocket (`<page directory>/ws`), so it works under a prefix such as `/syslog/`. Keep the WebSocket **under the same prefix** as the UI, so that whatever protects the UI (here Basic auth) protects the live stream too:
+
+```apache
+<Location /syslog>
+    AuthType Basic
+    AuthName "syslog"
+    AuthBasicProvider file
+    AuthUserFile "/etc/apache2/.htpasswd"
+    Require valid-user
+</Location>
+RewriteRule ^/syslog$ /syslog/ [R]
+
+# most specific first: the WebSocket, then the rest
+ProxyPass        "/syslog/ws" "ws://BACKEND:8088/ws"
+ProxyPassReverse "/syslog/ws" "ws://BACKEND:8088/ws"
+ProxyPass        "/syslog/"   "http://BACKEND:8088/" connectiontimeout=5 timeout=30
+```
+
+Apache sends the backend's own `Host`, while the browser sends `Origin: https://logs.example.com`, so list that origin in `config.json`:
+
+```json
+"web": { "allowed_origins": ["https://logs.example.com"] }
+```
+
+(or add `ProxyPreserveHost On` inside the `<Location>` and no list is needed). Do **not** expose a separate `/ws` outside the protected location, and restrict the backend port (for example `ufw allow from <proxy ip> to any port 8088`) so the proxy cannot be bypassed.
 
 ---
 

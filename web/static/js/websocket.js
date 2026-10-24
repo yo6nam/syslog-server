@@ -8,9 +8,13 @@ class WebSocketManager {
         this.FLUSH_DELAY_MS = 200;
     }
 
+    static basePath(pathname = window.location.pathname) {
+        return pathname.replace(/[^/]*$/, '');
+    }
+
     connect() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        const wsUrl = `${protocol}//${window.location.host}${WebSocketManager.basePath()}ws`;
 
         this.ws = new WebSocket(wsUrl);
 

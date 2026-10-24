@@ -51,7 +51,8 @@
   "web": {
     "basic_auth_user": "",
     "basic_auth_password": "",
-    "cors_allow_origin": ""
+    "cors_allow_origin": "",
+    "allowed_origins": []
   },
   "syslog": {
     "udp_read_buffer_bytes": 4194304,

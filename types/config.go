@@ -2,7 +2,9 @@ package types
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"strings"
 )
 
 type Config struct {
@@ -53,27 +55,26 @@ type Config struct {
 		ExcludePatterns []string `json:"exclude_patterns"`
 	} `json:"filters"`
 
-	// Dedup suprimă mesajele repetitive identice (după normalizare) și emite
-	// un singur rând rezumat ("... (repeated N times in Xs)").
 	Dedup struct {
 		Enabled            bool     `json:"enabled"`
-		WindowSeconds      int      `json:"window_seconds"`       // liniște după care se emite rezumatul
-		MaxIntervalSeconds int      `json:"max_interval_seconds"` // la flood continuu, rezumat cel puțin la atâtea secunde
-		MaxEntries         int      `json:"max_entries"`          // limită de memorie pentru amprentele urmărite
-		NormalizePatterns  []string `json:"normalize_patterns"`   // regex-uri eliminate înainte de comparare (în plus față de timestamp-urile kernel)
+		WindowSeconds      int      `json:"window_seconds"`
+		MaxIntervalSeconds int      `json:"max_interval_seconds"`
+		MaxEntries         int      `json:"max_entries"`
+		NormalizePatterns  []string `json:"normalize_patterns"`
 	} `json:"dedup"`
 
 	Web struct {
-		BasicAuthUser     string `json:"basic_auth_user"` // gol = fără autentificare
+		BasicAuthUser     string `json:"basic_auth_user"`
 		BasicAuthPassword string `json:"basic_auth_password"`
-		CORSAllowOrigin   string `json:"cors_allow_origin"` // gol = fără header CORS (UI-ul e same-origin)
+		CORSAllowOrigin   string `json:"cors_allow_origin"`
+		AllowedOrigins []string `json:"allowed_origins"`
 	} `json:"web"`
 
 	Syslog struct {
-		UDPReadBufferBytes int  `json:"udp_read_buffer_bytes"` // SO_RCVBUF pentru socket-ul UDP
-		UDPQueueSize       int  `json:"udp_queue_size"`        // coada dintre citirea UDP și procesare
+		UDPReadBufferBytes int  `json:"udp_read_buffer_bytes"`
+		UDPQueueSize       int  `json:"udp_queue_size"`
 		MaxTCPConnections  int  `json:"max_tcp_connections"`
-		LogEveryMessage    bool `json:"log_every_message"` // o linie de log per mesaj primit (zgomotos la volum mare)
+		LogEveryMessage    bool `json:"log_every_message"`
 	} `json:"syslog"`
 }
 
@@ -94,27 +95,22 @@ func LoadConfig(configPath string) (*Config, bool, error) {
 	config.Ports.SyslogUDP = "0.0.0.0:514"
 	config.Ports.Web = ":8080"
 
-	// Default rate limiter
 	config.RateLimiter.MessagesPerSecond = 100
 	config.RateLimiter.BurstSize = 200
 
-	// Default alerting
 	config.Alerting.Enabled = false
 	config.Alerting.WebhookURL = ""
 	config.Alerting.Severities = []string{"emergency", "critical"}
 	config.Alerting.RateLimitMinutes = 60
 	config.Alerting.TimeoutSeconds = 10
 
-	// ✅ Default retention
 	config.Retention.Enabled = false
 	config.Retention.Days = 90
 	config.Retention.RunAt = "02:00"
 
-	// Default ban list (gol)
 	config.BanList.IPs = []string{}
 	config.BanList.Hostnames = []string{}
 
-	// Default filters
 	config.Filters.ExcludePatterns = []string{}
 
 	config.Dedup.Enabled = true
@@ -123,21 +119,18 @@ func LoadConfig(configPath string) (*Config, bool, error) {
 	config.Dedup.MaxEntries = 10000
 	config.Dedup.NormalizePatterns = []string{}
 
+	config.Web.AllowedOrigins = []string{}
+
 	config.Syslog.UDPReadBufferBytes = 4 * 1024 * 1024
 	config.Syslog.UDPQueueSize = 8192
 	config.Syslog.MaxTCPConnections = 1000
 	config.Syslog.LogEveryMessage = false
 
-	// Încarcă din fișier dacă există
 	if configPath != "" {
 		file, err := os.Open(configPath)
 		if err != nil {
-			// Dacă fișierul nu există, scrie configul default pe disc
-			// (ca să existe ceva editabil) și continuă cu valorile default.
 			if os.IsNotExist(err) {
 				if writeErr := writeDefaultConfig(configPath, config); writeErr != nil {
-					// Nu putem scrie fișierul (ex: director read-only) — continuăm
-					// oricum cu valorile default, doar că nu vom avea un fișier creat.
 					return config, false, nil
 				}
 				return config, true, nil
@@ -155,7 +148,6 @@ func LoadConfig(configPath string) (*Config, bool, error) {
 	return config, false, nil
 }
 
-// writeDefaultConfig scrie configul default (formatat, ușor de editat) la configPath.
 func writeDefaultConfig(configPath string, config *Config) error {
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
@@ -164,8 +156,6 @@ func writeDefaultConfig(configPath string, config *Config) error {
 	return os.WriteFile(configPath, data, 0600)
 }
 
-// Validate corectează valorile imposibile/periculoase și întoarce avertismente
-// de afișat la pornire (în loc să pornească cu un limiter care blochează tot).
 func (c *Config) Validate() []string {
 	var warnings []string
 	fix := func(cond bool, msg string, apply func()) {
@@ -200,6 +190,15 @@ func (c *Config) Validate() []string {
 		func() { c.Syslog.MaxTCPConnections = 1000 })
 	fix(c.Syslog.UDPReadBufferBytes < 0, "syslog.udp_read_buffer_bytes < 0, using 4 MiB",
 		func() { c.Syslog.UDPReadBufferBytes = 4 * 1024 * 1024 })
+
+	for _, origin := range c.Web.AllowedOrigins {
+		if origin != "*" && !strings.Contains(origin, "://") {
+			warnings = append(warnings, fmt.Sprintf("web.allowed_origins entry %q should look like https://host[:port]", origin))
+		}
+		if origin == "*" {
+			warnings = append(warnings, "web.allowed_origins contains \"*\": any website can read the live logs through a visitor's browser")
+		}
+	}
 
 	if c.Web.BasicAuthUser != "" && c.Web.BasicAuthPassword == "" {
 		warnings = append(warnings, "web.basic_auth_user is set but web.basic_auth_password is empty")
