@@ -81,7 +81,6 @@ type Config struct {
 func LoadConfig(configPath string) (*Config, bool, error) {
 	config := &Config{}
 
-	// Valori default
 	config.MySQL.Enabled = false
 	config.MySQL.Host = "localhost"
 	config.MySQL.Port = "3306"
