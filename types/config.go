@@ -64,10 +64,10 @@ type Config struct {
 	} `json:"dedup"`
 
 	Web struct {
-		BasicAuthUser     string `json:"basic_auth_user"`
-		BasicAuthPassword string `json:"basic_auth_password"`
-		CORSAllowOrigin   string `json:"cors_allow_origin"`
-		AllowedOrigins []string `json:"allowed_origins"`
+		BasicAuthUser     string   `json:"basic_auth_user"`
+		BasicAuthPassword string   `json:"basic_auth_password"`
+		CORSAllowOrigin   string   `json:"cors_allow_origin"`
+		AllowedOrigins    []string `json:"allowed_origins"`
 	} `json:"web"`
 
 	Syslog struct {
